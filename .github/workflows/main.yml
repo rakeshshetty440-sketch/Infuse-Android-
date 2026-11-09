@@ -19,11 +19,30 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v3
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
 
-      - name: Configure Gradle Build
+      - name: Setup Gradle 8.8
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.8'
+
+      - name: Configure Project Structure
         run: |
+          mkdir -p res/values
+          cat << 'EOF' > res/values/strings.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">Infuse</string>
+          </resources>
+          EOF
+
+          cat << 'EOF' > gradle.properties
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          EOF
+
           cat << 'EOF' > settings.gradle.kts
           pluginManagement {
               repositories {
@@ -65,6 +84,7 @@ jobs:
                   named("main") {
                       manifest.srcFile("AndroidManifest.xml")
                       java.srcDirs(".")
+                      res.srcDirs("res")
                   }
               }
 
@@ -107,3 +127,4 @@ jobs:
           name: Infuse-Android-Player-Debug
           path: build/outputs/apk/debug/*.apk
           retention-days: 14
+          

@@ -24,10 +24,20 @@ jobs:
         with:
           gradle-version: '8.8'
 
-      - name: Configure Project Structure
+      - name: Organize Android Folders & Config
         run: |
-          mkdir -p res/values
-          cat << 'EOF' > res/values/strings.xml
+          mkdir -p app/src/main/java/com/infuse/player
+          mkdir -p app/src/main/res/values
+
+          # Move any root-uploaded Kotlin and Manifest files into standard Android structure
+          for f in *.kt; do
+            [ -f "$f" ] && mv "$f" app/src/main/java/com/infuse/player/
+          done
+          if [ -f "AndroidManifest.xml" ]; then
+            mv AndroidManifest.xml app/src/main/AndroidManifest.xml
+          fi
+
+          cat << 'EOF' > app/src/main/res/values/strings.xml
           <?xml version="1.0" encoding="utf-8"?>
           <resources>
               <string name="app_name">Infuse</string>
@@ -56,13 +66,22 @@ jobs:
               }
           }
           rootProject.name = "InfuseAndroid"
+          include(":app")
           EOF
 
           cat << 'EOF' > build.gradle.kts
           plugins {
-              id("com.android.application") version "8.5.2"
-              id("org.jetbrains.kotlin.android") version "2.0.0"
-              id("org.jetbrains.kotlin.plugin.compose") version "2.0.0"
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.0" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.0" apply false
+          }
+          EOF
+
+          cat << 'EOF' > app/build.gradle.kts
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
           }
 
           android {
@@ -77,14 +96,6 @@ jobs:
                   versionName = "1.0.0"
               }
 
-              sourceSets {
-                  named("main") {
-                      manifest.srcFile("AndroidManifest.xml")
-                      java.srcDirs(".")
-                      res.srcDirs("res")
-                  }
-              }
-
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
                   targetCompatibility = JavaVersion.VERSION_17
@@ -94,6 +105,11 @@ jobs:
               }
               buildFeatures {
                   compose = true
+              }
+              packaging {
+                  resources {
+                      excludes += "/META-INF/{AL2.0,LGPL2.1}"
+                  }
               }
           }
 
@@ -116,11 +132,12 @@ jobs:
           EOF
 
       - name: Build Debug APK
-        run: gradle assembleDebug --stacktrace
+        run: gradle :app:assembleDebug --stacktrace
 
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4
         with:
           name: Infuse-Android-Player-Debug
-          path: build/outputs/apk/debug/*.apk
+          path: app/build/outputs/apk/debug/*.apk
           retention-days: 14
+          

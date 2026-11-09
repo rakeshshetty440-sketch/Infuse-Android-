@@ -1,520 +1,1076 @@
+
 name: Build Infuse Android APK
 
 on:
-  push:
-    branches: [ main, master ]
   workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
 
 jobs:
   build:
-    name: Compile APK
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout Code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
-          java-version: '17'
+          distribution: temurin
+          java-version: "17"
 
-      - name: Setup Gradle 8.8
-        uses: gradle/actions/setup-gradle@v3
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.8'
+          gradle-version: "8.10.2"
 
-      - name: Generate Infuse v3.0 Universal Audio, Subtitles, Resume & MediaExtractor
+      - name: Create Android project
+        shell: bash
         run: |
-          rm -rf app/src/main/java *.kt
-          mkdir -p app/src/main/java/com/infuse/player/data/model
-          mkdir -p app/src/main/java/com/infuse/player/data/repository
-          mkdir -p app/src/main/java/com/infuse/player/data/scraper
-          mkdir -p app/src/main/java/com/infuse/player/ui/library
-          mkdir -p app/src/main/java/com/infuse/player/ui/player
-          mkdir -p app/src/main/java/com/infuse/player/ui/theme
+          mkdir -p app/src/main/java/com/infuse/player
           mkdir -p app/src/main/res/values
 
-          cat << 'EOF' > app/src/main/AndroidManifest.xml
-          <?xml version="1.0" encoding="utf-8"?>
-          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-              <uses-permission android:name="android.permission.INTERNET" />
-              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-              <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
-              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
-              <uses-permission android:name="android.permission.WAKE_LOCK" />
-              <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
 
-              <application
-                  android:allowBackup="true"
-                  android:icon="@android:drawable/sym_def_app_icon"
-                  android:label="Infuse"
-                  android:supportsRtl="true"
-                  android:theme="@android:style/Theme.Material.NoActionBar"
-                  android:hardwareAccelerated="true"
-                  android:largeHeap="true">
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
 
-                  <activity
-                      android:name=".MainActivity"
-                      android:exported="true"
-                      android:supportsPictureInPicture="true"
-                      android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|uiMode">
-                      <intent-filter>
-                          <action android:name="android.intent.action.MAIN" />
-                          <category android:name="android.intent.category.LAUNCHER" />
-                      </intent-filter>
-                      <intent-filter>
-                          <action android:name="android.intent.action.VIEW" />
-                          <category android:name="android.intent.category.DEFAULT" />
-                          <category android:name="android.intent.category.BROWSABLE" />
-                          <data android:mimeType="video/*" />
-                      </intent-filter>
-                  </activity>
-              </application>
-          </manifest>
+          rootProject.name = "InfusePlayer"
+          include(":app")
           EOF
 
-          cat << 'EOF' > app/src/main/res/values/strings.xml
-          <?xml version="1.0" encoding="utf-8"?>
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.21" apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF
+
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+          }
+
+          android {
+              namespace = "com.infuse.player"
+              compileSdk = 35
+
+              defaultConfig {
+                  applicationId = "com.infuse.player"
+                  minSdk = 23
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildFeatures {
+                  compose = true
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.12.01"))
+              implementation("androidx.activity:activity-compose:1.9.3")
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.ui:ui-tooling-preview")
+              implementation("androidx.compose.foundation:foundation")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.material:material-icons-extended")
+              implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
+
+              implementation("androidx.media3:media3-exoplayer:1.5.1")
+              implementation("androidx.media3:media3-ui:1.5.1")
+              implementation("androidx.media3:media3-exoplayer-hls:1.5.1")
+              implementation("androidx.media3:media3-exoplayer-dash:1.5.1")
+          }
+          EOF
+
+          cat > app/src/main/res/values/strings.xml <<'EOF'
           <resources>
               <string name="app_name">Infuse</string>
           </resources>
           EOF
 
-          cat << 'EOF' > app/src/main/java/com/infuse/player/data/model/MediaItem.kt
-          package com.infuse.player.data.model
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-          data class MediaItem(
-              val id: String,
-              val title: String,
-              val rawFilename: String = "",
-              val year: Int = 2026,
-              val durationText: String = "--",
-              val durationSeconds: Long = 0L,
-              val rating: String = "8.5",
-              val qualityTag: String = "HD",
-              val resolution: String = "1920x1080",
-              val frameRate: String = "24 fps",
-              val hdrFormat: String = "SDR (8-bit)",
-              val audioSpec: String = "AAC Stereo",
-              val audioDetails: String = "48.0 kHz • 2 Channels",
-              val videoCodec: String = "H.264 / AVC",
-              val container: String = "MKV",
-              val bitrate: String = "--",
-              val fileSize: String = "--",
-              val subtitleSummary: String = "None detected",
-              val streamUri: String,
-              val posterUrl: String = "",
-              val backdropUrl: String = "",
-              val synopsis: String = "Scanning metadata...",
-              val savedPositionMs: Long = 0L,
-              val isWatched: Boolean = false
-          ) {
-              val progressFraction: Float
-                  get() = if (durationSeconds > 0) (savedPositionMs.toFloat() / (durationSeconds * 1000f)).coerceIn(0f, 1f) else 0f
-          }
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="Infuse"
+                  android:theme="@android:style/Theme.Material.NoActionBar"
+                  android:usesCleartextTraffic="true">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:configChanges="orientation|screenSize|keyboardHidden"
+                      android:screenOrientation="unspecified"
+                      android:exported="true">
+
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+
+                  </activity>
+              </application>
+          </manifest>
           EOF
 
-          cat << 'EOF' > app/src/main/java/com/infuse/player/data/scraper/FilenameParser.kt
-          package com.infuse.player.data.scraper
+          cat > app/src/main/java/com/infuse/player/MainActivity.kt <<'EOF'
+          package com.infuse.player
 
-          object FilenameParser {
-              private val TV_REGEX = Regex("(?i)[._ -]S(\\d{1,2})[._ -]?E(\\d{1,3})")
-              private val YEAR_REGEX = Regex("[._ -]\\(?((?:19\vert{}20)\\d{2})\\)?")
-              private val TAGS = listOf(
-                  "2160p", "1080p", "720p", "480p", "4k", "uhd", "hdr", "hdr10", "dv", "dovi",
-                  "remux", "bluray", "bdrip", "web-dl", "webrip", "hdtv", "x264", "x265",
-                  "h264", "h265", "hevc", "av1", "10bit", "truehd", "atmos", "dts", "ac3", "eac3", "aac"
-              )
-
-              data class ParsedInfo(val cleanTitle: String, val year: Int?, val isTv: Boolean)
-
-              fun parse(rawFilename: String): ParsedInfo {
-                  val name = rawFilename.substringBeforeLast(".")
-                  val tvMatch = TV_REGEX.find(name)
-                  if (tvMatch != null) {
-                      val raw = name.substring(0, tvMatch.range.first)
-                      return ParsedInfo(clean(raw), null, true)
-                  }
-                  val yearMatch = YEAR_REGEX.find(name)
-                  val year = yearMatch?.groupValues?.get(1)?.toIntOrNull()
-                  val raw = if (yearMatch != null) name.substring(0, yearMatch.range.first) else name
-                  val cleaned = clean(raw)
-                  return ParsedInfo(if (cleaned.isNotBlank()) cleaned else name, year, false)
-              }
-
-              private fun clean(raw: String): String {
-                  var s = raw.replace(Regex("[._\\[\\]()-]"), " ").trim()
-                  TAGS.forEach { tag -> s = s.replace(Regex("(?i)\\b$tag\\b"), "") }
-                  return s.replace(Regex("\\s+"), " ").trim()
-              }
-          }
-          EOF
-
-          cat << 'EOF' > app/src/main/java/com/infuse/player/data/scraper/TmdbScraperService.kt
-          package com.infuse.player.data.scraper
-
-          import com.infuse.player.data.model.MediaItem
-          import kotlinx.coroutines.Dispatchers
-          import kotlinx.coroutines.withContext
-          import okhttp3.OkHttpClient
-          import okhttp3.Request
-          import org.json.JSONObject
-          import java.net.URLEncoder
-
-          class TmdbScraperService(
-              private val apiKey: String = "f52f0d6c1b1784ece4eed64ff99052ac",
-              private val client: OkHttpClient = OkHttpClient()
-          ) {
-              suspend fun enrichWithMetadata(item: MediaItem): MediaItem = withContext(Dispatchers.IO) {
-                  val parsed = FilenameParser.parse(item.rawFilename.ifEmpty { item.title })
-                  val query = URLEncoder.encode(parsed.cleanTitle, "UTF-8")
-                  val endpoint = if (parsed.isTv) "search/tv" else "search/movie"
-                  val yearParam = if (parsed.year != null && !parsed.isTv) "&year=${parsed.year}" else ""
-                  val url = "https://api.themoviedb.org/3/$endpoint?api_key=$apiKey&query=$query$yearParam"
-
-                  try {
-                      val req = Request.Builder().url(url).build()
-                      client.newCall(req).execute().use { res ->
-                          if (res.isSuccessful) {
-                              val json = JSONObject(res.body?.string() ?: "{}")
-                              val results = json.optJSONArray("results")
-                              if (results != null && results.length() > 0) {
-                                  val first = results.getJSONObject(0)
-                                  val officialTitle = if (parsed.isTv) first.optString("name", parsed.cleanTitle) else first.optString("title", parsed.cleanTitle)
-                                  val poster = first.optString("poster_path", "")
-                                  val backdrop = first.optString("backdrop_path", "")
-                                  val overview = first.optString("overview", "")
-                                  val vote = first.optDouble("vote_average", 8.0)
-                                  val date = if (parsed.isTv) first.optString("first_air_date") else first.optString("release_date")
-                                  val yr = date.take(4).toIntOrNull() ?: parsed.year ?: item.year
-
-                                  return@withContext item.copy(
-                                      title = officialTitle,
-                                      year = yr,
-                                      rating = String.format("%.1f", vote),
-                                      posterUrl = if (poster.isNotEmpty()) "https://image.tmdb.org/t/p/w500$poster" else item.posterUrl,
-                                      backdropUrl = if (backdrop.isNotEmpty()) "https://image.tmdb.org/t/p/w1280$backdrop" else item.backdropUrl,
-                                      synopsis = if (overview.isNotEmpty()) overview else "Local file: ${item.rawFilename}"
-                                  )
-                              }
-                          }
-                      }
-                  } catch (_: Exception) {}
-
-                  item.copy(
-                      title = parsed.cleanTitle,
-                      year = parsed.year ?: item.year,
-                      synopsis = "Local video (${item.rawFilename}) •${item.resolution} • ${item.videoCodec} •${item.audioSpec}"
-                  )
-              }
-          }
-          EOF
-
-          cat << 'EOF' > app/src/main/java/com/infuse/player/data/repository/MediaRepository.kt
-          package com.infuse.player.data.repository
-
-          import android.content.ContentUris
           import android.content.Context
-          import android.media.MediaExtractor
-          import android.media.MediaFormat
-          import android.media.MediaMetadataRetriever
+          import android.content.Intent
           import android.net.Uri
-          import android.provider.MediaStore
-          import android.provider.OpenableColumns
-          import com.infuse.player.data.model.MediaItem
-          import com.infuse.player.data.scraper.TmdbScraperService
-          import kotlinx.coroutines.CoroutineScope
-          import kotlinx.coroutines.Dispatchers
-          import kotlinx.coroutines.flow.MutableStateFlow
-          import kotlinx.coroutines.flow.StateFlow
-          import kotlinx.coroutines.flow.asStateFlow
-          import kotlinx.coroutines.launch
+          import android.os.Bundle
+          import android.view.ViewGroup
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.Add
+          import androidx.compose.material.icons.filled.ArrowBack
+          import androidx.compose.material.icons.filled.PlayArrow
+          import androidx.compose.material.icons.filled.Settings
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.compose.ui.viewinterop.AndroidView
+          import androidx.media3.common.C
+          import androidx.media3.common.MediaItem
+          import androidx.media3.common.MimeTypes
+          import androidx.media3.common.Player
+          import androidx.media3.common.TrackSelectionOverride
+          import androidx.media3.common.Tracks
+          import androidx.media3.exoplayer.ExoPlayer
+          import androidx.media3.exoplayer.DefaultRenderersFactory
+          import androidx.media3.ui.PlayerView
+          import kotlinx.coroutines.delay
           import java.util.Locale
 
-          class MediaRepository(private val context: Context) {
-              private val scraper = TmdbScraperService()
-              private val scope = CoroutineScope(Dispatchers.IO)
-              private val prefs = context.getSharedPreferences("infuse_playback_state", Context.MODE_PRIVATE)
+          private data class VideoFile(
+              val uri: Uri,
+              val name: String,
+              val position: Long = 0L,
+              val duration: Long = 0L
+          )
 
-              private val _mediaList = MutableStateFlow<List<MediaItem>>(emptyList())
-              val mediaList: StateFlow<List<MediaItem>> = _mediaList.asStateFlow()
+          private data class TrackOption(
+              val title: String,
+              val group: Tracks.Group,
+              val index: Int,
+              val selected: Boolean
+          )
 
-              private val _isScanning = MutableStateFlow(false)
-              val isScanning: StateFlow<Boolean> = _isScanning.asStateFlow()
-
-              fun savePlaybackPosition(streamUri: String, positionMs: Long, durationMs: Long) {
-                  prefs.edit().putLong("pos_$streamUri", positionMs).apply()
-                  val watched = durationMs > 0 && positionMs >= (durationMs * 0.92)
-                  if (watched) {
-                      prefs.edit().putBoolean("watched_$streamUri", true).apply()
-                  }
-                  _mediaList.value = _mediaList.value.map {
-                      if (it.streamUri == streamUri) {
-                          it.copy(savedPositionMs = positionMs, isWatched = watched || it.isWatched)
-                      } else it
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContent {
+                      InfuseApp()
                   }
               }
+          }
 
-              fun getSavedPosition(streamUri: String): Long {
-                  return prefs.getLong("pos_$streamUri", 0L)
+          @OptIn(ExperimentalMaterial3Api::class)
+          @Composable
+          private fun InfuseApp() {
+              val context = LocalContext.current
+              val prefs = remember {
+                  context.getSharedPreferences("infuse_player", Context.MODE_PRIVATE)
               }
 
-              fun scanDeviceVideos() {
-                  scope.launch {
-                      _isScanning.value = true
-                      val discovered = mutableListOf<MediaItem>()
-                      val projection = arrayOf(
-                          MediaStore.Video.Media._ID,
-                          MediaStore.Video.Media.DISPLAY_NAME,
-                          MediaStore.Video.Media.DURATION,
-                          MediaStore.Video.Media.SIZE,
-                          MediaStore.Video.Media.WIDTH,
-                          MediaStore.Video.Media.HEIGHT
-                      )
-                      val sortOrder = "${MediaStore.Video.Media.DATE_ADDED} DESC"
+              var library by remember { mutableStateOf(loadLibrary(prefs)) }
+              var currentVideo by remember { mutableStateOf<VideoFile?>(null) }
+              var player by remember { mutableStateOf<ExoPlayer?>(null) }
+              var tracks by remember { mutableStateOf(Tracks.EMPTY) }
+              var showAudio by remember { mutableStateOf(false) }
+              var showSubtitles by remember { mutableStateOf(false) }
+              var isPlaying by remember { mutableStateOf(false) }
+              var currentPosition by remember { mutableLongStateOf(0L) }
+              var currentDuration by remember { mutableLongStateOf(0L) }
+              var statusMessage by remember { mutableStateOf("") }
 
+              val videoPicker = rememberLauncherForActivityResult(
+                  ActivityResultContracts.OpenMultipleDocuments()
+              ) { uris ->
+                  uris.forEach { uri ->
                       try {
-                          context.contentResolver.query(
-                              MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
-                              projection,
-                              null,
-                              null,
-                              sortOrder
-                          )?.use { cursor ->
-                              val idCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media._ID)
-                              val nameCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DISPLAY_NAME)
-                              val durCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DURATION)
-                              val sizeCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.SIZE)
-                              val widthCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.WIDTH)
-                              val heightCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.HEIGHT)
+                          context.contentResolver.takePersistableUriPermission(
+                              uri,
+                              Intent.FLAG_GRANT_READ_URI_PERMISSION
+                          )
+                      } catch (_: Exception) {
+                      }
 
-                              while (cursor.moveToNext()) {
-                                  val id = cursor.getLong(idCol)
-                                  val name = cursor.getString(nameCol) ?: "Video_$id.mp4"
-                                  val durationMs = cursor.getLong(durCol)
-                                  val sizeBytes = cursor.getLong(sizeCol)
-                                  val w = cursor.getInt(widthCol)
-                                  val h = cursor.getInt(heightCol)
-                                  val contentUri = ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, id)
+                      val name = displayName(context, uri)
+                      if (library.none { it.uri == uri }) {
+                          library = library + VideoFile(uri, name)
+                      }
+                  }
+                  saveLibrary(prefs, library)
+              }
 
-                                  val baseItem = inspectTrackFormatsAndCreateItem(
-                                      id = "local_$id",
-                                      name = name,
-                                      uri = contentUri,
-                                      fallbackDurationMs = durationMs,
-                                      sizeBytes = sizeBytes,
-                                      fallbackW = w,
-                                      fallbackH = h
+              val subtitlePicker = rememberLauncherForActivityResult(
+                  ActivityResultContracts.OpenDocument()
+              ) { uri ->
+                  if (uri != null && player != null && currentVideo != null) {
+                      try {
+                          context.contentResolver.takePersistableUriPermission(
+                              uri,
+                              Intent.FLAG_GRANT_READ_URI_PERMISSION
+                          )
+                      } catch (_: Exception) {
+                      }
+
+                      val name = displayName(context, uri)
+                      val mime = subtitleMimeType(name, context, uri)
+
+                      val subtitle = MediaItem.SubtitleConfiguration.Builder(uri)
+                          .setMimeType(mime)
+                          .setLanguage("und")
+                          .setLabel(name)
+                          .setSelectionFlags(C.SELECTION_FLAG_DEFAULT)
+                          .build()
+
+                      val video = currentVideo!!
+                      val mediaItem = MediaItem.Builder()
+                          .setUri(video.uri)
+                          .setSubtitleConfigurations(listOf(subtitle))
+                          .build()
+
+                      val resumeAt = player!!.currentPosition
+                      player!!.setMediaItem(mediaItem, resumeAt)
+                      player!!.prepare()
+                      player!!.playWhenReady = true
+                      player!!.trackSelectionParameters =
+                          player!!.trackSelectionParameters
+                              .buildUpon()
+                              .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
+                              .clearOverridesOfType(C.TRACK_TYPE_TEXT)
+                              .build()
+                      statusMessage = "Subtitle loaded: $name"
+                  }
+              }
+
+              fun stopPlayer() {
+                  player?.let {
+                      saveProgress(prefs, currentVideo, it.currentPosition, it.duration)
+                      it.release()
+                  }
+                  player = null
+                  currentVideo = null
+                  tracks = Tracks.EMPTY
+                  isPlaying = false
+              }
+
+              fun playVideo(video: VideoFile) {
+                  player?.release()
+
+                  val renderers = DefaultRenderersFactory(context)
+                      .setExtensionRendererMode(
+                          DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER
+                      )
+                      .setEnableDecoderFallback(true)
+
+                  val exo = ExoPlayer.Builder(context)
+                      .setRenderersFactory(renderers)
+                      .build()
+
+                  player = exo
+                  currentVideo = video
+
+                  exo.addListener(object : Player.Listener {
+                      override fun onTracksChanged(newTracks: Tracks) {
+                          tracks = newTracks
+                      }
+
+                      override fun onIsPlayingChanged(playing: Boolean) {
+                          isPlaying = playing
+                      }
+
+                      override fun onPlaybackStateChanged(state: Int) {
+                          if (state == Player.STATE_ENDED) {
+                              saveProgress(prefs, video, 0L, exo.duration)
+                              library = library.map {
+                                  if (it.uri == video.uri) it.copy(position = 0L) else it
+                              }
+                              saveLibrary(prefs, library)
+                          }
+                      }
+                  })
+
+                  exo.setMediaItem(
+                      MediaItem.fromUri(video.uri),
+                      video.position.coerceAtLeast(0L)
+                  )
+                  exo.prepare()
+                  exo.playWhenReady = true
+                  statusMessage = ""
+              }
+
+              LaunchedEffect(player, currentVideo) {
+                  while (player != null && currentVideo != null) {
+                      val active = player
+                      val video = currentVideo
+                      if (active != null && video != null) {
+                          currentPosition = active.currentPosition.coerceAtLeast(0L)
+                          currentDuration =
+                              if (active.duration > 0L) active.duration else 0L
+
+                          saveProgress(
+                              prefs,
+                              video,
+                              active.currentPosition,
+                              active.duration
+                          )
+
+                          library = library.map {
+                              if (it.uri == video.uri) {
+                                  it.copy(
+                                      position = active.currentPosition.coerceAtLeast(0L),
+                                      duration = active.duration.coerceAtLeast(0L)
                                   )
-                                  discovered.add(baseItem)
-                              }
+                              } else it
                           }
-                      } catch (_: Exception) {}
-
-                      if (discovered.isEmpty()) {
-                          discovered.addAll(defaultDemoSamples())
                       }
-                      _mediaList.value = discovered
-
-                      val enrichedList = discovered.toMutableList()
-                      for (i in enrichedList.indices) {
-                          val enriched = scraper.enrichWithMetadata(enrichedList[i])
-                          enrichedList[i] = enriched
-                          _mediaList.value = enrichedList.toList()
-                      }
-                      _isScanning.value = false
+                      delay(2000)
                   }
               }
 
-              fun addPickedVideoUri(uri: Uri, onReady: (MediaItem) -> Unit) {
-                  scope.launch {
-                      var displayName = "Local_Video.mkv"
-                      var sizeBytes = 0L
-                      try {
-                          context.contentResolver.query(uri, null, null, null, null)?.use { c ->
-                              if (c.moveToFirst()) {
-                                  val nameIdx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                                  val sizeIdx = c.getColumnIndex(OpenableColumns.SIZE)
-                                  if (nameIdx != -1) displayName = c.getString(nameIdx) ?: displayName
-                                  if (sizeIdx != -1) sizeBytes = c.getLong(sizeIdx)
-                              }
-                          }
-                      } catch (_: Exception) {}
+              val audioOptions = remember(tracks) {
+                  getTrackOptions(tracks, C.TRACK_TYPE_AUDIO)
+              }
+              val subtitleOptions = remember(tracks) {
+                  getTrackOptions(tracks, C.TRACK_TYPE_TEXT)
+              }
 
-                      val rawItem = inspectTrackFormatsAndCreateItem(
-                          id = "picked_${System.currentTimeMillis()}",
-                          name = displayName,
-                          uri = uri,
-                          fallbackDurationMs = 0L,
-                          sizeBytes = sizeBytes,
-                          fallbackW = 1920,
-                          fallbackH = 1080
+              MaterialTheme(
+                  colorScheme = darkColorScheme(
+                      primary = Color(0xFF8AB4F8),
+                      background = Color(0xFF101114),
+                      surface = Color(0xFF1A1C20)
+                  )
+              ) {
+                  Surface(
+                      modifier = Modifier.fillMaxSize(),
+                      color = Color(0xFF101114)
+                  ) {
+                      if (currentVideo == null) {
+                          LibraryScreen(
+                              library = library,
+                              onAdd = {
+                                  videoPicker.launch(
+                                      arrayOf("video/*", "application/x-mpegURL")
+                                  )
+                              },
+                              onPlay = { playVideo(it) },
+                              onRemove = { video ->
+                                  library = library.filterNot { it.uri == video.uri }
+                                  saveLibrary(prefs, library)
+                              }
+                          )
+                      } else {
+                          PlayerScreen(
+                              video = currentVideo!!,
+                              player = player,
+                              tracks = tracks,
+                              audioOptions = audioOptions,
+                              subtitleOptions = subtitleOptions,
+                              currentPosition = currentPosition,
+                              currentDuration = currentDuration,
+                              isPlaying = isPlaying,
+                              statusMessage = statusMessage,
+                              onBack = {
+                                  stopPlayer()
+                              },
+                              onAudio = { showAudio = true },
+                              onSubtitles = { showSubtitles = true },
+                              onAddSubtitle = {
+                                  subtitlePicker.launch(
+                                      arrayOf(
+                                          "application/x-subrip",
+                                          "text/vtt",
+                                          "text/plain",
+                                          "application/octet-stream"
+                                      )
+                                  )
+                              }
+                          )
+                      }
+
+                      if (showAudio) {
+                          TrackDialog(
+                              title = "Audio language",
+                              options = audioOptions,
+                              onDismiss = { showAudio = false },
+                              onOff = null,
+                              onSelect = { option ->
+                                  player?.let { exo ->
+                                      exo.trackSelectionParameters =
+                                          exo.trackSelectionParameters
+                                              .buildUpon()
+                                              .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, false)
+                                              .clearOverridesOfType(C.TRACK_TYPE_AUDIO)
+                                              .addOverride(
+                                                  TrackSelectionOverride(
+                                                      option.group.mediaTrackGroup,
+                                                      listOf(option.index)
+                                                  )
+                                              )
+                                              .build()
+                                  }
+                                  showAudio = false
+                              }
+                          )
+                      }
+
+                      if (showSubtitles) {
+                          TrackDialog(
+                              title = "Subtitles",
+                              options = subtitleOptions,
+                              onDismiss = { showSubtitles = false },
+                              onOff = {
+                                  player?.let { exo ->
+                                      exo.trackSelectionParameters =
+                                          exo.trackSelectionParameters
+                                              .buildUpon()
+                                              .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
+                                              .clearOverridesOfType(C.TRACK_TYPE_TEXT)
+                                              .build()
+                                  }
+                                  showSubtitles = false
+                              },
+                              onSelect = { option ->
+                                  player?.let { exo ->
+                                      exo.trackSelectionParameters =
+                                          exo.trackSelectionParameters
+                                              .buildUpon()
+                                              .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
+                                              .clearOverridesOfType(C.TRACK_TYPE_TEXT)
+                                              .addOverride(
+                                                  TrackSelectionOverride(
+                                                      option.group.mediaTrackGroup,
+                                                      listOf(option.index)
+                                                  )
+                                              )
+                                              .build()
+                                  }
+                                  showSubtitles = false
+                              }
+                          )
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun LibraryScreen(
+              library: List<VideoFile>,
+              onAdd: () -> Unit,
+              onPlay: (VideoFile) -> Unit,
+              onRemove: (VideoFile) -> Unit
+          ) {
+              val continueWatching = library.filter {
+                  it.position > 5000L &&
+                  (it.duration <= 0L || it.position < it.duration * 0.92)
+              }
+
+              Column(
+                  modifier = Modifier
+                      .fillMaxSize()
+                      .background(Color(0xFF101114))
+                      .padding(18.dp)
+              ) {
+                  Row(
+                      modifier = Modifier.fillMaxWidth(),
+                      verticalAlignment = Alignment.CenterVertically,
+                      horizontalArrangement = Arrangement.SpaceBetween
+                  ) {
+                      Column {
+                          Text(
+                              "INFUSE",
+                              color = Color.White,
+                              fontSize = 28.sp,
+                              fontWeight = FontWeight.Bold
+                          )
+                          Text(
+                              "Your personal media library",
+                              color = Color.Gray,
+                              fontSize = 13.sp
+                          )
+                      }
+
+                      IconButton(onClick = onAdd) {
+                          Icon(
+                              Icons.Default.Add,
+                              contentDescription = "Add videos",
+                              tint = Color.White
+                          )
+                      }
+                  }
+
+                  Spacer(Modifier.height(24.dp))
+
+                  if (continueWatching.isNotEmpty()) {
+                      Text(
+                          "Continue Watching",
+                          color = Color.White,
+                          fontSize = 20.sp,
+                          fontWeight = FontWeight.Bold
                       )
-                      val enriched = scraper.enrichWithMetadata(rawItem)
-                      _mediaList.value = listOf(enriched) + _mediaList.value.filter { it.streamUri != enriched.streamUri }
-                      kotlinx.coroutines.withContext(Dispatchers.Main) {
-                          onReady(enriched)
+                      Spacer(Modifier.height(10.dp))
+
+                      LazyColumn(
+                          modifier = Modifier.heightIn(max = 220.dp)
+                      ) {
+                          items(continueWatching, key = { it.uri.toString() }) { video ->
+                              VideoCard(
+                                  video = video,
+                                  resume = true,
+                                  onPlay = { onPlay(video) },
+                                  onRemove = { onRemove(video) }
+                              )
+                          }
                       }
-                  }
-              }
 
-              fun toggleWatched(id: String) {
-                  _mediaList.value = _mediaList.value.map {
-                      if (it.id == id) {
-                          val nextWatched = !it.isWatched
-                          prefs.edit().putBoolean("watched_${it.streamUri}", nextWatched).apply()
-                          if (!nextWatched) prefs.edit().putLong("pos_${it.streamUri}", 0L).apply()
-                          it.copy(isWatched = nextWatched, savedPositionMs = if (!nextWatched) 0L else it.savedPositionMs)
-                      } else it
-                  }
-              }
-
-              private fun inspectTrackFormatsAndCreateItem(
-                  id: String,
-                  name: String,
-                  uri: Uri,
-                  fallbackDurationMs: Long,
-                  sizeBytes: Long,
-                  fallbackW: Int,
-                  fallbackH: Int
-              ): MediaItem {
-                  var durationMs = fallbackDurationMs
-                  var width = fallbackW
-                  var height = fallbackH
-                  var bitrateBps = 0L
-
-                  val retriever = MediaMetadataRetriever()
-                  try {
-                      retriever.setDataSource(context, uri)
-                      if (durationMs <= 0L) {
-                          durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
-                      }
-                      val rw = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull()
-                      val rh = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull()
-                      if (rw != null && rw > 0) width = rw
-                      if (rh != null && rh > 0) height = rh
-                      bitrateBps = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)?.toLongOrNull() ?: 0L
-                  } catch (_: Exception) {
-                  } finally {
-                      try { retriever.release() } catch (_: Exception) {}
+                      Spacer(Modifier.height(20.dp))
                   }
 
-                  var vCodecName = "H.264 / AVC"
-                  var frameRateStr = "24 fps"
-                  var hdrStr = "SDR (8-bit)"
-                  var aCodecName = "AAC Audio"
-                  var aDetailStr = "48.0 kHz • Stereo"
-                  val audioTracksFound = mutableListOf<String>()
-                  val subTracksFound = mutableListOf<String>()
+                  Text(
+                      "My Library",
+                      color = Color.White,
+                      fontSize = 20.sp,
+                      fontWeight = FontWeight.Bold
+                  )
 
-                  val extractor = MediaExtractor()
-                  try {
-                      extractor.setDataSource(context, uri, null)
-                      for (i in 0 until extractor.trackCount) {
-                          val format = extractor.getTrackFormat(i)
-                          val mime = format.getString(MediaFormat.KEY_MIME) ?: ""
-                          val lang = if (format.containsKey(MediaFormat.KEY_LANGUAGE)) format.getString(MediaFormat.KEY_LANGUAGE) ?: "und" else "und"
+                  Spacer(Modifier.height(10.dp))
 
-                          if (mime.startsWith("video/")) {
-                              vCodecName = formatFriendlyCodec(mime)
-                              if (format.containsKey(MediaFormat.KEY_FRAME_RATE)) {
-                                  try {
-                                      val fr = format.getInteger(MediaFormat.KEY_FRAME_RATE)
-                                      frameRateStr = "$fr fps"
-                                  } catch (_: Exception) {}
+                  if (library.isEmpty()) {
+                      Box(
+                          modifier = Modifier.fillMaxSize(),
+                          contentAlignment = Alignment.Center
+                      ) {
+                          Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                              Text(
+                                  "Your library is empty",
+                                  color = Color.White,
+                                  fontSize = 18.sp
+                              )
+                              Spacer(Modifier.height(8.dp))
+                              Text(
+                                  "Add videos from your device to get started.",
+                                  color = Color.Gray
+                              )
+                              Spacer(Modifier.height(16.dp))
+                              Button(onClick = onAdd) {
+                                  Text("Add Videos")
                               }
-                              if (format.containsKey(MediaFormat.KEY_COLOR_TRANSFER)) {
-                                  val ct = format.getInteger(MediaFormat.KEY_COLOR_TRANSFER)
-                                  hdrStr = when (ct) {
-                                      6 -> "HDR10 (PQ 10-bit)"
-                                      7 -> "HLG HDR"
-                                      else -> "SDR (Rec.709)"
+                          }
+                      }
+                  } else {
+                      LazyColumn(
+                          verticalArrangement = Arrangement.spacedBy(10.dp)
+                      ) {
+                          items(library, key = { it.uri.toString() }) { video ->
+                              VideoCard(
+                                  video = video,
+                                  resume = false,
+                                  onPlay = { onPlay(video) },
+                                  onRemove = { onRemove(video) }
+                              )
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun VideoCard(
+              video: VideoFile,
+              resume: Boolean,
+              onPlay: () -> Unit,
+              onRemove: () -> Unit
+          ) {
+              Column(
+                  modifier = Modifier
+                      .fillMaxWidth()
+                      .background(Color(0xFF1B1D22), RoundedCornerShape(14.dp))
+                      .padding(14.dp)
+              ) {
+                  Row(
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      Box(
+                          modifier = Modifier
+                              .size(52.dp)
+                              .background(
+                                  Color(0xFF30343B),
+                                  RoundedCornerShape(10.dp)
+                              ),
+                          contentAlignment = Alignment.Center
+                      ) {
+                          Icon(
+                              Icons.Default.PlayArrow,
+                              contentDescription = null,
+                              tint = Color.White
+                          )
+                      }
+
+                      Spacer(Modifier.width(12.dp))
+
+                      Column(modifier = Modifier.weight(1f)) {
+                          Text(
+                              video.name,
+                              color = Color.White,
+                              fontWeight = FontWeight.SemiBold,
+                              maxLines = 2
+                          )
+                          if (resume) {
+                              Text(
+                                  "Resume from ${formatTime(video.position)}",
+                                  color = Color.Gray,
+                                  fontSize = 12.sp
+                              )
+                          } else {
+                              Text(
+                                  "Video",
+                                  color = Color.Gray,
+                                  fontSize = 12.sp
+                              )
+                          }
+                      }
+
+                      TextButton(onClick = onRemove) {
+                          Text("Remove", color = Color.Gray)
+                      }
+                  }
+
+                  if (resume && video.duration > 0L) {
+                      Spacer(Modifier.height(10.dp))
+                      LinearProgressIndicator(
+                          progress = {
+                              (video.position.toFloat() / video.duration)
+                                  .coerceIn(0f, 1f)
+                          },
+                          modifier = Modifier.fillMaxWidth(),
+                          color = Color(0xFF8AB4F8),
+                          trackColor = Color.DarkGray
+                      )
+                  }
+
+                  Spacer(Modifier.height(8.dp))
+
+                  Button(
+                      onClick = onPlay,
+                      modifier = Modifier.fillMaxWidth()
+                  ) {
+                      Icon(Icons.Default.PlayArrow, contentDescription = null)
+                      Spacer(Modifier.width(6.dp))
+                      Text(if (resume) "Resume" else "Play")
+                  }
+              }
+          }
+
+          @Composable
+          private fun PlayerScreen(
+              video: VideoFile,
+              player: ExoPlayer?,
+              tracks: Tracks,
+              audioOptions: List<TrackOption>,
+              subtitleOptions: List<TrackOption>,
+              currentPosition: Long,
+              currentDuration: Long,
+              isPlaying: Boolean,
+              statusMessage: String,
+              onBack: () -> Unit,
+              onAudio: () -> Unit,
+              onSubtitles: () -> Unit,
+              onAddSubtitle: () -> Unit
+          ) {
+              Column(
+                  modifier = Modifier
+                      .fillMaxSize()
+                      .background(Color.Black)
+              ) {
+                  Row(
+                      modifier = Modifier
+                          .fillMaxWidth()
+                          .background(Color(0xFF151515))
+                          .padding(horizontal = 8.dp, vertical = 4.dp),
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      IconButton(onClick = onBack) {
+                          Icon(
+                              Icons.Default.ArrowBack,
+                              contentDescription = "Back",
+                              tint = Color.White
+                          )
+                      }
+
+                      Text(
+                          video.name,
+                          color = Color.White,
+                          modifier = Modifier.weight(1f),
+                          maxLines = 1
+                      )
+
+                      IconButton(onClick = onAudio) {
+                          Icon(
+                              Icons.Default.Settings,
+                              contentDescription = "Audio language",
+                              tint = Color.White
+                          )
+                      }
+                  }
+
+                  Box(
+                      modifier = Modifier
+                          .fillMaxWidth()
+                          .weight(1f),
+                      contentAlignment = Alignment.Center
+                  ) {
+                      if (player != null) {
+                          key(player) {
+                              AndroidView(
+                                  factory = { ctx ->
+                                      PlayerView(ctx).apply {
+                                          layoutParams = ViewGroup.LayoutParams(
+                                              ViewGroup.LayoutParams.MATCH_PARENT,
+                                              ViewGroup.LayoutParams.MATCH_PARENT
+                                          )
+                                          this.player = player
+                                          useController = true
+                                          controllerAutoShow = true
+                                          setShowSubtitleButton(true)
+                                      }
+                                  },
+                                  update = { it.player = player },
+                                  modifier = Modifier.fillMaxSize()
+                              )
+                          }
+                      }
+                  }
+
+                  Column(
+                      modifier = Modifier
+                          .fillMaxWidth()
+                          .background(Color(0xFF151515))
+                          .padding(14.dp)
+                  ) {
+                      Text(
+                          video.name,
+                          color = Color.White,
+                          fontWeight = FontWeight.Bold
+                      )
+
+                      Spacer(Modifier.height(5.dp))
+
+                      Text(
+                          "${formatTime(currentPosition)} / ${formatTime(currentDuration)}",
+                          color = Color.Gray,
+                          fontSize = 12.sp
+                      )
+
+                      Spacer(Modifier.height(12.dp))
+
+                      Row(
+                          modifier = Modifier.fillMaxWidth(),
+                          horizontalArrangement = Arrangement.spacedBy(8.dp)
+                      ) {
+                          OutlinedButton(
+                              onClick = onAudio,
+                              modifier = Modifier.weight(1f)
+                          ) {
+                              Text("Audio (${audioOptions.size})")
+                          }
+
+                          OutlinedButton(
+                              onClick = onSubtitles,
+                              modifier = Modifier.weight(1f)
+                          ) {
+                              Text("Subtitles (${subtitleOptions.size})")
+                          }
+                      }
+
+                      Spacer(Modifier.height(4.dp))
+
+                      OutlinedButton(
+                          onClick = onAddSubtitle,
+                          modifier = Modifier.fillMaxWidth()
+                      ) {
+                          Text("Add external subtitle file")
+                      }
+
+                      if (statusMessage.isNotBlank()) {
+                          Text(
+                              statusMessage,
+                              color = Color(0xFF8AB4F8),
+                              fontSize = 12.sp
+                          )
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun TrackDialog(
+              title: String,
+              options: List<TrackOption>,
+              onDismiss: () -> Unit,
+              onOff: (() -> Unit)?,
+              onSelect: (TrackOption) -> Unit
+          ) {
+              AlertDialog(
+                  onDismissRequest = onDismiss,
+                  title = { Text(title) },
+                  text = {
+                      Column {
+                          if (onOff != null) {
+                              TextButton(
+                                  onClick = onOff,
+                                  modifier = Modifier.fillMaxWidth()
+                              ) {
+                                  Text("Off")
+                              }
+                          }
+
+                          if (options.isEmpty()) {
+                              Text(
+                                  "No tracks were detected in this video.",
+                                  color = Color.Gray
+                              )
+                          } else {
+                              options.forEach { option ->
+                                  Row(
+                                      modifier = Modifier
+                                          .fillMaxWidth()
+                                          .clickable { onSelect(option) }
+                                          .padding(vertical = 10.dp),
+                                      verticalAlignment = Alignment.CenterVertically
+                                  ) {
+                                      RadioButton(
+                                          selected = option.selected,
+                                          onClick = { onSelect(option) }
+                                      )
+                                      Spacer(Modifier.width(8.dp))
+                                      Text(option.title)
                                   }
                               }
-                          } else if (mime.startsWith("audio/")) {
-                              val friendlyAudio = formatFriendlyCodec(mime)
-                              val ch = if (format.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) format.getInteger(MediaFormat.KEY_CHANNEL_COUNT) else 2
-                              val sr = if (format.containsKey(MediaFormat.KEY_SAMPLE_RATE)) format.getInteger(MediaFormat.KEY_SAMPLE_RATE) else 48000
-                              val chLayout = when (ch) {
-                                  1 -> "Mono 1.0"
-                                  2 -> "Stereo 2.0"
-                                  6 -> "Surround 5.1"
-                                  8 -> "Surround 7.1"
-                                  else -> "$ch Channels"
-                              }
-                              if (audioTracksFound.isEmpty()) {
-                                  aCodecName = "$friendlyAudio ($chLayout)"
-                                  aDetailStr = "${String.format(Locale.US, "%.1f", sr / 1000.0)} kHz • $chLayout • ${lang.uppercase()}"
-                              }
-                              audioTracksFound.add("$friendlyAudio $chLayout (${lang.uppercase()})")
-                          } else if (mime.startsWith("text/") || mime.contains("cea") || mime.contains("subrip") || mime.contains("ssa") || mime.contains("vtt") || mime.contains("pgs")) {
-                              subTracksFound.add("${lang.uppercase()} (${formatFriendlyCodec(mime)})")
                           }
                       }
+                  },
+                  confirmButton = {
+                      TextButton(onClick = onDismiss) {
+                          Text("Close")
+                      }
+                  }
+              )
+          }
+
+          private fun getTrackOptions(
+              tracks: Tracks,
+              type: Int
+          ): List<TrackOption> {
+              val result = mutableListOf<TrackOption>()
+
+              for (group in tracks.groups) {
+                  if (group.type != type) continue
+
+                  for (index in 0 until group.length) {
+                      val format = group.getTrackFormat(index)
+                      val language = format.language
+                          ?.takeIf { it.isNotBlank() && it != "und" }
+                          ?.let { Locale.forLanguageTag(it).getDisplayLanguage() }
+
+                      val label = format.label
+                          ?.takeIf { it.isNotBlank() }
+                          ?: language
+                          ?: when (type) {
+                              C.TRACK_TYPE_AUDIO -> "Audio track ${index + 1}"
+                              else -> "Subtitle track ${index + 1}"
+                          }
+
+                      result.add(
+                          TrackOption(
+                              title = label,
+                              group = group,
+                              index = index,
+                              selected = group.isTrackSelected(index)
+                          )
+                      )
+                  }
+              }
+
+              return result
+          }
+
+          private fun subtitleMimeType(
+              name: String,
+              context: Context,
+              uri: Uri
+          ): String {
+              return when (name.substringAfterLast('.', "").lowercase()) {
+                  "srt" -> MimeTypes.APPLICATION_SUBRIP
+                  "vtt" -> MimeTypes.TEXT_VTT
+                  "ass", "ssa" -> MimeTypes.TEXT_SSA
+                  "ttml", "xml" -> MimeTypes.APPLICATION_TTML
+                  else -> {
+                      when (context.contentResolver.getType(uri)) {
+                          "text/vtt" -> MimeTypes.TEXT_VTT
+                          "application/ttml+xml" -> MimeTypes.APPLICATION_TTML
+                          else -> MimeTypes.APPLICATION_SUBRIP
+                      }
+                  }
+              }
+          }
+
+          private fun displayName(context: Context, uri: Uri): String {
+              var name = uri.lastPathSegment ?: "Video"
+              try {
+                  context.contentResolver.query(
+                      uri,
+                      arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),
+                      null,
+                      null,
+                      null
+                  )?.use { cursor ->
+                      if (cursor.moveToFirst()) {
+                          val index = cursor.getColumnIndex(
+                              android.provider.OpenableColumns.DISPLAY_NAME
+                          )
+                          if (index >= 0) name = cursor.getString(index) ?: name
+                      }
+                  }
+              } catch (_: Exception) {
+              }
+              return name
+          }
+
+          private fun loadLibrary(prefs: android.content.SharedPreferences): List<VideoFile> {
+              val raw = prefs.getString("library", null) ?: return emptyList()
+              return raw.split("\n").mapNotNull { line ->
+                  val parts = line.split("|")
+                  if (parts.size < 3) return@mapNotNull null
+                  try {
+                      VideoFile(
+                          uri = Uri.parse(Uri.decode(parts[0])),
+                          name = Uri.decode(parts[1]),
+                          position = parts[2].toLongOrNull() ?: 0L,
+                          duration = parts.getOrNull(3)?.toLongOrNull() ?: 0L
+                      )
                   } catch (_: Exception) {
-                  } finally {
-                      try { extractor.release() } catch (_: Exception) {}
+                      null
                   }
+              }
+          }
 
-                  val ext = name.substringAfterLast(".", "MKV").uppercase(Locale.ROOT)
-                  val containerName = when (ext) {
-                      "MKV" -> "Matroska (MKV)"
-                      "MP4", "M4V" -> "MPEG-4 (MP4)"
-                      "AVI" -> "Audio Video Interleave (AVI)"
-                      "TS", "M2TS" -> "MPEG Transport Stream (TS)"
-                      "WEBM" -> "WebM Media"
-                      "MOV" -> "QuickTime (MOV)"
-                      else -> ext
-                  }
+          private fun saveLibrary(
+              prefs: android.content.SharedPreferences,
+              library: List<VideoFile>
+          ) {
+              val raw = library.joinToString("\n") {
+                  listOf(
+                      Uri.encode(it.uri.toString()),
+                      Uri.encode(it.name),
+                      it.position.toString(),
+                      it.duration.toString()
+                  ).joinToString("|")
+              }
+              prefs.edit().putString("library", raw).apply()
+          }
 
-                  val quality = when {
-                      width >= 3800 || height >= 2100 -> "4K UHD"
-                      width >= 2500 || height >= 1400 -> "1440p QHD"
-                      width >= 1900 || height >= 1000 -> "1080p FHD"
-                      width >= 1200 || height >= 700 -> "720p HD"
-                      else -> "SD Direct"
-                  }
+          private fun saveProgress(
+              prefs: android.content.SharedPreferences,
+              video: VideoFile?,
+              position: Long,
+              duration: Long
+          ) {
+              if (video == null) return
 
-                  val sizeText = if (sizeBytes >= 1024L * 1024L * 1024L) {
-                      String.format(Locale.US, "%.2f GB", sizeBytes / (1024.0 * 1024.0 * 1024.0))
-                  } else if (sizeBytes > 0) {
-                      String.format(Locale.US, "%.1f MB", sizeBytes / (1024.0 * 1024.0))
-                  } else "Direct Stream"
+              val completed = duration > 0L &&
+                  position >= duration * 0.92
 
-                  val calcBitrate = if (bitrateBps > 0) {
-                      String.format(Locale.US, "%.1f Mbps", bitrateBps / 1_000_000.0)
-                  } else if (durationMs > 0 && sizeBytes > 0) {
-                      val bps = (sizeBytes * 8.0) / (durationMs / 1000.0)
-                      String.format(Locale.US, "%.1f Mbps", bps / 1_000_000.0)
-                  } else "Variable"
+              val savedPosition = if (completed) 0L else position.coerceAtLeast(0L)
 
-                  val totalSecs = durationMs / 1000
-                  val hrs = totalSecs / 3600
-                  val mins = (totalSecs % 3600) / 60
-                  val durText = if (hrs > 0) "${hrs}h${mins}m" else "${mins}m${(totalSecs % 60)}s"
+              prefs.edit()
+                  .putLong("position_${video.uri}", savedPosition)
+                  .putLong("duration_${video.uri}", duration.coerceAtLeast(0L))
+                  .apply()
+          }
 
-                  val savedPos = prefs.getLong("pos_$uri", 0L)
-                  val savedWatched = prefs.getBoolean("watched_$uri", false)
+          private fun formatTime(ms: Long): String {
+              if (ms <= 0L) return "00:00"
+              val totalSeconds = ms / 1000
+              val hours = totalSeconds / 3600
+              val minutes = (totalSeconds % 3600) / 60
+              val seconds = totalSeconds % 60
 
-                  return MediaItem(
-                      id = id,
-                      title = name.substringBeforeLast("."),
-                      rawFilename = name,
-                      year = 2026,
-                      durationText = durText,
-                      durationSeconds = totalSecs,
-                      rating = "Local",
-                      qualityTag = quality,
-                      resolution = "${width}x${height}",
-                      frameRate = frameRateStr,
-                      hdrFormat = hdrStr,
-                      audioSpec = aCodecName,
-                      audioDetails = if (audioTracksFound.size > 1) "$aDetailStr (+${audioTracksFound.size - 1} more)" else aDetailStr,
-                      videoCodec = vCodecName,
-                      container = containerName,
-                      bitrate = calcBitrate,
-                      fileSize = sizeText,
-                      subtitleSummary = if (subTracksFound.isNotEmpty()) subTracksFound.joinToString(", ") else "Supports External .SRT / .ASS / .VTT",
-                      streamUri = uri.toString(),
-                      posterUrl = 
+              return if (hours > 0) {
+                  "%02d:%02d:%02d".format(hours, minutes, seconds)
+              } else {
+                  "%02d:%02d".format(minutes, seconds)
+              }
+          }
+          EOF
+
+      - name: Build debug APK
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Infuse-Android-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error

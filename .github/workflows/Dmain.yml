@@ -1,4 +1,3 @@
-
 name: Build Infuse Android APK
 
 on:
@@ -12,12 +11,11 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up JDK
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -28,7 +26,7 @@ jobs:
         with:
           gradle-version: "8.10.2"
 
-      - name: Generate complete Android project
+      - name: Generate Infuse project
         shell: bash
         run: |
           mkdir -p app/src/main/java/com/infuse/player
@@ -82,12 +80,21 @@ jobs:
                   applicationId = "com.infuse.player"
                   minSdk = 23
                   targetSdk = 35
-                  versionCode = 2
-                  versionName = "2.0"
+                  versionCode = 3
+                  versionName = "3.0"
               }
 
               buildFeatures {
                   compose = true
+                  buildConfig = true
+              }
+
+              defaultConfig {
+                  buildConfigField(
+                      "String",
+                      "TMDB_API_KEY",
+                      "\\"${System.getenv("TMDB_API_KEY") ?: ""}\\""
+                  )
               }
 
               compileOptions {
@@ -109,11 +116,16 @@ jobs:
               implementation("androidx.compose.material3:material3")
               implementation("androidx.compose.material:material-icons-extended")
               implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
+              implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
 
               implementation("androidx.media3:media3-exoplayer:1.5.1")
               implementation("androidx.media3:media3-ui:1.5.1")
               implementation("androidx.media3:media3-exoplayer-hls:1.5.1")
               implementation("androidx.media3:media3-exoplayer-dash:1.5.1")
+
+              implementation("io.coil-kt:coil-compose:2.7.0")
+              implementation("com.squareup.okhttp3:okhttp:4.12.0")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
           }
           EOF
 
@@ -125,26 +137,21 @@ jobs:
 
           cat > app/src/main/AndroidManifest.xml <<'EOF'
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-
               <uses-permission android:name="android.permission.INTERNET" />
               <uses-permission android:name="android.permission.WAKE_LOCK" />
-
               <application
                   android:allowBackup="true"
                   android:label="Infuse"
                   android:theme="@android:style/Theme.Material.NoActionBar"
-                  android:usesCleartextTraffic="true">
-
+                  android:usesCleartextTraffic="false">
                   <activity
                       android:name=".MainActivity"
                       android:exported="true"
                       android:configChanges="orientation|screenSize|keyboardHidden">
-
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN" />
                           <category android:name="android.intent.category.LAUNCHER" />
                       </intent-filter>
-
                   </activity>
               </application>
           </manifest>
@@ -157,32 +164,44 @@ jobs:
           import android.content.Intent
           import android.net.Uri
           import android.os.Bundle
-          import android.widget.Toast
           import androidx.activity.ComponentActivity
+          import androidx.activity.compose.BackHandler
           import androidx.activity.compose.setContent
           import androidx.activity.compose.rememberLauncherForActivityResult
           import androidx.activity.result.contract.ActivityResultContracts
           import androidx.compose.foundation.background
           import androidx.compose.foundation.clickable
           import androidx.compose.foundation.layout.*
-          import androidx.compose.foundation.lazy.LazyColumn
-          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.lazy.grid.GridCells
+          import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+          import androidx.compose.foundation.lazy.grid.items
           import androidx.compose.foundation.shape.RoundedCornerShape
           import androidx.compose.material.icons.Icons
           import androidx.compose.material.icons.filled.Add
           import androidx.compose.material.icons.filled.ArrowBack
+          import androidx.compose.material.icons.filled.Close
           import androidx.compose.material.icons.filled.PlayArrow
+          import androidx.compose.material.icons.filled.Refresh
           import androidx.compose.material3.*
           import androidx.compose.runtime.*
           import androidx.compose.runtime.saveable.rememberSaveable
           import androidx.compose.ui.Alignment
           import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Brush
           import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.layout.ContentScale
           import androidx.compose.ui.platform.LocalContext
           import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextOverflow
           import androidx.compose.ui.unit.dp
           import androidx.compose.ui.unit.sp
           import androidx.compose.ui.viewinterop.AndroidView
+          import androidx.compose.ui.window.Dialog
+          import androidx.compose.ui.window.DialogProperties
+          import androidx.lifecycle.Lifecycle
+          import androidx.lifecycle.LifecycleEventObserver
+          import androidx.lifecycle.compose.LocalLifecycleOwner
           import androidx.media3.common.C
           import androidx.media3.common.MediaItem
           import androidx.media3.common.MimeTypes
@@ -192,26 +211,52 @@ jobs:
           import androidx.media3.exoplayer.DefaultRenderersFactory
           import androidx.media3.exoplayer.ExoPlayer
           import androidx.media3.ui.PlayerView
+          import coil.compose.AsyncImage
+          import kotlinx.coroutines.Dispatchers
           import kotlinx.coroutines.delay
+          import kotlinx.coroutines.withContext
+          import okhttp3.OkHttpClient
+          import okhttp3.Request
+          import org.json.JSONObject
+          import java.net.URLEncoder
           import java.util.Locale
+          import java.util.concurrent.TimeUnit
 
-          private val BG = Color(0xFF0B0C0F)
-          private val PANEL = Color(0xFF1B1D22)
-          private val ORANGE = Color(0xFFFF790F)
+          private val BG = Color(0xFF090A0D)
+          private val SURFACE = Color(0xFF17191E)
+          private val MUTED = Color(0xFF9A9DA5)
+          private val ACCENT = Color(0xFFFF7917)
 
-          private data class VideoFile(
+          private data class MovieInfo(
+              val title: String = "",
+              val overview: String = "",
+              val year: String = "",
+              val rating: String = "",
+              val poster: String? = null,
+              val backdrop: String? = null,
+              val genre: String = "",
+              val mediaType: String = "movie"
+          )
+
+          private data class VideoEntry(
               val uri: Uri,
-              val name: String,
+              val fileName: String,
+              val info: MovieInfo = MovieInfo(),
               val position: Long = 0L,
               val duration: Long = 0L
           )
 
-          private data class TrackOption(
-              val title: String,
+          private data class TrackChoice(
+              val label: String,
               val group: Tracks.Group,
               val index: Int,
               val selected: Boolean
           )
+
+          private val http = OkHttpClient.Builder()
+              .connectTimeout(12, TimeUnit.SECONDS)
+              .readTimeout(12, TimeUnit.SECONDS)
+              .build()
 
           class MainActivity : ComponentActivity() {
               override fun onCreate(savedInstanceState: Bundle?) {
@@ -220,273 +265,175 @@ jobs:
               }
           }
 
-          @OptIn(ExperimentalMaterial3Api::class)
           @Composable
           private fun InfuseApp() {
               val context = LocalContext.current
               val prefs = remember {
-                  context.getSharedPreferences("infuse_library", Context.MODE_PRIVATE)
+                  context.getSharedPreferences("infuse_v3", Context.MODE_PRIVATE)
               }
-
-              var library by remember {
-                  mutableStateOf(loadLibrary(prefs))
-              }
-              var currentVideo by remember {
-                  mutableStateOf<VideoFile?>(null)
-              }
-              var player by remember {
-                  mutableStateOf<ExoPlayer?>(null)
-              }
-              var tracks by remember {
-                  mutableStateOf(Tracks.EMPTY)
-              }
+              var library by remember { mutableStateOf(loadLibrary(prefs)) }
+              var active by remember { mutableStateOf<VideoEntry?>(null) }
+              var player by remember { mutableStateOf<ExoPlayer?>(null) }
+              var tracks by remember { mutableStateOf(Tracks.EMPTY) }
+              var selectedDetails by remember { mutableStateOf<VideoEntry?>(null) }
               var showAudio by rememberSaveable { mutableStateOf(false) }
               var showSubtitles by rememberSaveable { mutableStateOf(false) }
-              var statusMessage by remember {
-                  mutableStateOf("Select Open Video to add a video.")
-              }
-              var currentPosition by remember {
-                  mutableLongStateOf(0L)
-              }
-              var currentDuration by remember {
-                  mutableLongStateOf(0L)
-              }
-              var isPlaying by remember {
-                  mutableStateOf(false)
+              var message by remember { mutableStateOf("") }
+              var position by remember { mutableLongStateOf(0L) }
+              var duration by remember { mutableLongStateOf(0L) }
+              var refreshing by remember { mutableStateOf(false) }
+
+              suspend fun enrich(entry: VideoEntry): VideoEntry {
+                  if (BuildConfig.TMDB_API_KEY.isBlank()) return entry
+                  val info = withContext(Dispatchers.IO) {
+                      searchTmdb(entry.fileName, BuildConfig.TMDB_API_KEY)
+                  }
+                  return if (info != null) entry.copy(info = info) else entry
               }
 
-              // Use OpenDocument so Android returns one selected video URI.
               val videoPicker = rememberLauncherForActivityResult(
-                  contract = ActivityResultContracts.OpenDocument()
+                  ActivityResultContracts.OpenDocument()
               ) { uri ->
                   if (uri == null) {
-                      statusMessage = "No video was selected."
+                      message = "No video selected."
                   } else {
                       try {
                           context.contentResolver.takePersistableUriPermission(
-                              uri,
-                              Intent.FLAG_GRANT_READ_URI_PERMISSION
+                              uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
                           )
-
-                          val name = displayName(context, uri)
-                          val existing = library.firstOrNull {
-                              it.uri.toString() == uri.toString()
-                          }
-
-                          val savedPosition = prefs.getLong(
-                              "position_${uri}",
-                              existing?.position ?: 0L
-                          )
-                          val savedDuration = prefs.getLong(
-                              "duration_${uri}",
-                              existing?.duration ?: 0L
-                          )
-
-                          val imported = VideoFile(
-                              uri = uri,
-                              name = name,
-                              position = savedPosition,
-                              duration = savedDuration
-                          )
-
-                          library = library.filterNot {
-                              it.uri.toString() == uri.toString()
-                          } + imported
-
-                          saveLibrary(prefs, library)
-                          statusMessage = "Added successfully: $name"
-
-                          Toast.makeText(
-                              context,
-                              "Video added to Infuse",
-                              Toast.LENGTH_SHORT
-                          ).show()
-
-                      } catch (error: Exception) {
-                          statusMessage =
-                              "Import failed: ${error.localizedMessage ?: "Unknown error"}"
-                          Toast.makeText(
-                              context,
-                              statusMessage,
-                              Toast.LENGTH_LONG
-                          ).show()
-                      }
+                      } catch (_: Exception) {}
+                      val name = displayName(context, uri)
+                      val old = library.firstOrNull { it.uri == uri }
+                      val entry = VideoEntry(
+                          uri = uri,
+                          fileName = name,
+                          info = old?.info ?: MovieInfo(),
+                          position = prefs.getLong("pos_${uri}", old?.position ?: 0L),
+                          duration = prefs.getLong("dur_${uri}", old?.duration ?: 0L)
+                      )
+                      library = (library.filterNot { it.uri == uri } + entry)
+                      saveLibrary(prefs, library)
+                      message = "Added: $name"
                   }
               }
 
               val subtitlePicker = rememberLauncherForActivityResult(
-                  contract = ActivityResultContracts.OpenDocument()
+                  ActivityResultContracts.OpenDocument()
               ) { uri ->
-                  val activePlayer = player
-                  val video = currentVideo
-
-                  if (uri == null) {
-                      statusMessage = "No subtitle selected."
-                  } else if (activePlayer != null && video != null) {
+                  val exo = player
+                  val entry = active
+                  if (uri != null && exo != null && entry != null) {
                       try {
                           context.contentResolver.takePersistableUriPermission(
-                              uri,
-                              Intent.FLAG_GRANT_READ_URI_PERMISSION
+                              uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
                           )
-                      } catch (_: Exception) {
-                      }
-
+                      } catch (_: Exception) {}
                       try {
                           val name = displayName(context, uri)
-                          val mime = subtitleMimeType(name, context, uri)
-
                           val subtitle = MediaItem.SubtitleConfiguration.Builder(uri)
-                              .setMimeType(mime)
+                              .setMimeType(subtitleMime(name, context, uri))
                               .setLanguage("und")
                               .setLabel(name)
                               .setSelectionFlags(C.SELECTION_FLAG_DEFAULT)
                               .build()
-
-                          val position = activePlayer.currentPosition
-
-                          val mediaItem = MediaItem.Builder()
-                              .setUri(video.uri)
+                          val item = MediaItem.Builder()
+                              .setUri(entry.uri)
                               .setSubtitleConfigurations(listOf(subtitle))
                               .build()
-
-                          activePlayer.setMediaItem(mediaItem, position)
-                          activePlayer.prepare()
-                          activePlayer.playWhenReady = true
-
-                          activePlayer.trackSelectionParameters =
-                              activePlayer.trackSelectionParameters
-                                  .buildUpon()
+                          val at = exo.currentPosition
+                          exo.setMediaItem(item, at)
+                          exo.prepare()
+                          exo.playWhenReady = true
+                          exo.trackSelectionParameters =
+                              exo.trackSelectionParameters.buildUpon()
                                   .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
                                   .clearOverridesOfType(C.TRACK_TYPE_TEXT)
                                   .build()
-
-                          statusMessage = "Subtitle loaded: $name"
-                      } catch (error: Exception) {
-                          statusMessage =
-                              "Subtitle error: ${error.localizedMessage ?: "Unsupported file"}"
+                          message = "Subtitle added: $name"
+                      } catch (e: Exception) {
+                          message = "Subtitle error: ${e.message}"
                       }
                   }
               }
 
-              fun releasePlayer() {
-                  val active = player
-                  val video = currentVideo
-
-                  if (active != null && video != null) {
-                      saveProgress(
-                          prefs,
-                          video,
-                          active.currentPosition,
-                          active.duration
-                      )
-                      active.release()
+              fun closePlayer() {
+                  val exo = player
+                  val entry = active
+                  if (exo != null && entry != null) {
+                      savePosition(prefs, entry, exo.currentPosition, exo.duration)
+                      exo.playWhenReady = false
+                      exo.stop()
+                      exo.release()
                   }
-
                   player = null
-                  currentVideo = null
+                  active = null
                   tracks = Tracks.EMPTY
-                  isPlaying = false
+                  position = 0L
+                  duration = 0L
               }
 
-              fun startVideo(video: VideoFile) {
+              fun start(entry: VideoEntry) {
                   player?.release()
-
                   try {
                       val renderers = DefaultRenderersFactory(context)
                           .setExtensionRendererMode(
                               DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER
                           )
                           .setEnableDecoderFallback(true)
-
                       val exo = ExoPlayer.Builder(context)
                           .setRenderersFactory(renderers)
                           .build()
-
                       player = exo
-                      currentVideo = video
-                      currentPosition = video.position
-                      currentDuration = video.duration
-                      statusMessage = "Loading ${video.name}"
-
+                      active = entry
+                      position = entry.position
+                      duration = entry.duration
+                      message = "Loading ${entry.fileName}"
                       exo.addListener(object : Player.Listener {
                           override fun onTracksChanged(newTracks: Tracks) {
                               tracks = newTracks
                           }
-
-                          override fun onIsPlayingChanged(playing: Boolean) {
-                              isPlaying = playing
-                          }
-
                           override fun onPlaybackStateChanged(state: Int) {
-                              if (state == Player.STATE_READY) {
-                                  statusMessage = ""
-                              }
-
+                              if (state == Player.STATE_READY) message = ""
                               if (state == Player.STATE_ENDED) {
-                                  saveProgress(
-                                      prefs,
-                                      video,
-                                      exo.duration,
-                                      exo.duration
-                                  )
-
+                                  savePosition(prefs, entry, exo.duration, exo.duration)
                                   library = library.map {
-                                      if (it.uri == video.uri) {
-                                          it.copy(position = 0L)
-                                      } else it
+                                      if (it.uri == entry.uri) it.copy(position = 0L) else it
                                   }
                                   saveLibrary(prefs, library)
                               }
                           }
-
-                          override fun onPlayerError(
-                              error: androidx.media3.common.PlaybackException
-                          ) {
-                              statusMessage =
-                                  "Playback error: ${error.errorCodeName}"
+                          override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+                              message = "Playback failed: ${error.errorCodeName}"
                           }
                       })
-
                       exo.setMediaItem(
-                          MediaItem.fromUri(video.uri),
-                          video.position.coerceAtLeast(0L)
+                          MediaItem.fromUri(entry.uri),
+                          entry.position.coerceAtLeast(0L)
                       )
                       exo.prepare()
                       exo.playWhenReady = true
-
-                  } catch (error: Exception) {
-                      statusMessage =
-                          "Cannot open video: ${error.localizedMessage ?: "Unknown error"}"
+                  } catch (e: Exception) {
+                      message = "Could not open video: ${e.message}"
                       player?.release()
                       player = null
-                      currentVideo = null
+                      active = null
                   }
               }
 
-              // Save position every two seconds and update the library.
-              LaunchedEffect(player, currentVideo) {
-                  while (player != null && currentVideo != null) {
-                      delay(2000)
-
-                      val active = player
-                      val video = currentVideo
-
-                      if (active != null && video != null) {
-                          val position = active.currentPosition.coerceAtLeast(0L)
-                          val duration = active.duration.coerceAtLeast(0L)
-
-                          currentPosition = position
-                          currentDuration = duration
-
-                          saveProgress(prefs, video, position, duration)
-
+              // Save playback position while playing and when the app backgrounds.
+              LaunchedEffect(player, active) {
+                  while (player != null && active != null) {
+                      delay(1500)
+                      val exo = player
+                      val entry = active
+                      if (exo != null && entry != null) {
+                          position = exo.currentPosition.coerceAtLeast(0L)
+                          duration = exo.duration.coerceAtLeast(0L)
+                          savePosition(prefs, entry, position, duration)
                           library = library.map {
-                              if (it.uri == video.uri) {
+                              if (it.uri == entry.uri) {
                                   it.copy(
-                                      position = if (
-                                          duration > 0L &&
-                                          position >= duration * 0.92
-                                      ) 0L else position,
+                                      position = if (isComplete(position, duration)) 0L else position,
                                       duration = duration
                                   )
                               } else it
@@ -496,59 +443,59 @@ jobs:
                   }
               }
 
-              val audioOptions = remember(tracks) {
-                  getTrackOptions(tracks, C.TRACK_TYPE_AUDIO)
+              val lifecycleOwner = LocalLifecycleOwner.current
+              DisposableEffect(lifecycleOwner, player, active) {
+                  val observer = LifecycleEventObserver { _, event ->
+                      if (event == Lifecycle.Event.ON_PAUSE) {
+                          val exo = player
+                          val entry = active
+                          if (exo != null && entry != null) {
+                              savePosition(prefs, entry, exo.currentPosition, exo.duration)
+                              exo.pause()
+                          }
+                      }
+                  }
+                  lifecycleOwner.lifecycle.addObserver(observer)
+                  onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
               }
 
-              val subtitleOptions = remember(tracks) {
-                  getTrackOptions(tracks, C.TRACK_TYPE_TEXT)
-              }
+              BackHandler(enabled = active != null) { closePlayer() }
+
+              val audioChoices = remember(tracks) { getChoices(tracks, C.TRACK_TYPE_AUDIO) }
+              val textChoices = remember(tracks) { getChoices(tracks, C.TRACK_TYPE_TEXT) }
 
               MaterialTheme(
                   colorScheme = darkColorScheme(
-                      primary = ORANGE,
+                      primary = ACCENT,
                       background = BG,
-                      surface = PANEL
+                      surface = SURFACE
                   )
               ) {
-                  Surface(
-                      modifier = Modifier.fillMaxSize(),
-                      color = BG
-                  ) {
-                      if (currentVideo == null) {
+                  Surface(Modifier.fillMaxSize(), color = BG) {
+                      if (active == null) {
                           LibraryScreen(
                               library = library,
-                              statusMessage = statusMessage,
-                              onAdd = {
-                                  statusMessage = "Opening video picker..."
-                                  videoPicker.launch(arrayOf("video/*"))
+                              message = message,
+                              onAdd = { videoPicker.launch(arrayOf("video/*")) },
+                              onRefresh = {
+                                  refreshing = true
                               },
-                              onPlay = { startVideo(it) },
-                              onRemove = { video ->
-                                  library = library.filterNot {
-                                      it.uri == video.uri
-                                  }
-                                  saveLibrary(prefs, library)
-                                  prefs.edit()
-                                      .remove("position_${video.uri}")
-                                      .remove("duration_${video.uri}")
-                                      .apply()
-                                  statusMessage = "Video removed."
-                              }
+                              onSelect = { selectedDetails = it },
+                              onPlay = { start(it) }
                           )
                       } else {
                           PlayerScreen(
-                              video = currentVideo!!,
+                              entry = active!!,
                               player = player,
-                              audioCount = audioOptions.size,
-                              subtitleCount = subtitleOptions.size,
-                              currentPosition = currentPosition,
-                              currentDuration = currentDuration,
-                              statusMessage = statusMessage,
-                              onBack = { releasePlayer() },
+                              position = position,
+                              duration = duration,
+                              audioCount = audioChoices.size,
+                              subtitleCount = textChoices.size,
+                              message = message,
+                              onBack = { closePlayer() },
                               onAudio = { showAudio = true },
-                              onSubtitles = { showSubtitles = true },
-                              onAddSubtitle = {
+                              onSubs = { showSubtitles = true },
+                              onExternalSubs = {
                                   subtitlePicker.launch(
                                       arrayOf(
                                           "application/x-subrip",
@@ -561,31 +508,35 @@ jobs:
                           )
                       }
 
+                      selectedDetails?.let { entry ->
+                          MovieDetailsDialog(
+                              entry = entry,
+                              onDismiss = { selectedDetails = null },
+                              onPlay = {
+                                  selectedDetails = null
+                                  start(entry)
+                              }
+                          )
+                      }
+
                       if (showAudio) {
                           TrackDialog(
-                              title = "Select audio language",
-                              options = audioOptions,
+                              title = "Audio language",
+                              choices = audioChoices,
                               onDismiss = { showAudio = false },
                               onOff = null,
-                              onSelect = { option ->
+                              onChoose = { choice ->
                                   player?.let { exo ->
                                       exo.trackSelectionParameters =
-                                          exo.trackSelectionParameters
-                                              .buildUpon()
-                                              .setTrackTypeDisabled(
-                                                  C.TRACK_TYPE_AUDIO,
-                                                  false
-                                              )
-                                              .clearOverridesOfType(
-                                                  C.TRACK_TYPE_AUDIO
-                                              )
+                                          exo.trackSelectionParameters.buildUpon()
+                                              .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, false)
+                                              .clearOverridesOfType(C.TRACK_TYPE_AUDIO)
                                               .addOverride(
                                                   TrackSelectionOverride(
-                                                      option.group.mediaTrackGroup,
-                                                      listOf(option.index)
+                                                      choice.group.mediaTrackGroup,
+                                                      listOf(choice.index)
                                                   )
-                                              )
-                                              .build()
+                                              ).build()
                                   }
                                   showAudio = false
                               }
@@ -594,48 +545,71 @@ jobs:
 
                       if (showSubtitles) {
                           TrackDialog(
-                              title = "Select subtitles",
-                              options = subtitleOptions,
+                              title = "Subtitles",
+                              choices = textChoices,
                               onDismiss = { showSubtitles = false },
                               onOff = {
                                   player?.let { exo ->
                                       exo.trackSelectionParameters =
-                                          exo.trackSelectionParameters
-                                              .buildUpon()
-                                              .setTrackTypeDisabled(
-                                                  C.TRACK_TYPE_TEXT,
-                                                  true
-                                              )
-                                              .clearOverridesOfType(
-                                                  C.TRACK_TYPE_TEXT
-                                              )
+                                          exo.trackSelectionParameters.buildUpon()
+                                              .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
+                                              .clearOverridesOfType(C.TRACK_TYPE_TEXT)
                                               .build()
                                   }
                                   showSubtitles = false
                               },
-                              onSelect = { option ->
+                              onChoose = { choice ->
                                   player?.let { exo ->
                                       exo.trackSelectionParameters =
-                                          exo.trackSelectionParameters
-                                              .buildUpon()
-                                              .setTrackTypeDisabled(
-                                                  C.TRACK_TYPE_TEXT,
-                                                  false
-                                              )
-                                              .clearOverridesOfType(
-                                                  C.TRACK_TYPE_TEXT
-                                              )
+                                          exo.trackSelectionParameters.buildUpon()
+                                              .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
+                                              .clearOverridesOfType(C.TRACK_TYPE_TEXT)
                                               .addOverride(
                                                   TrackSelectionOverride(
-                                                      option.group.mediaTrackGroup,
-                                                      listOf(option.index)
+                                                      choice.group.mediaTrackGroup,
+                                                      listOf(choice.index)
                                                   )
-                                              )
-                                              .build()
+                                              ).build()
                                   }
                                   showSubtitles = false
                               }
                           )
+                      }
+                  }
+              }
+
+              LaunchedEffect(library.size) {
+                  val needsMetadata = library.filter {
+                      it.info.title.isBlank() && BuildConfig.TMDB_API_KEY.isNotBlank()
+                  }
+                  needsMetadata.forEach { item ->
+                      val updated = enrich(item)
+                      if (updated.info.title.isNotBlank()) {
+                          library = library.map {
+                              if (it.uri == item.uri) updated else it
+                          }
+                          saveLibrary(prefs, library)
+                      }
+                  }
+              }
+
+              LaunchedEffect(refreshing) {
+                  if (refreshing) {
+                      val snapshot = library
+                      snapshot.forEach { item ->
+                          val updated = enrich(item.copy(info = MovieInfo()))
+                          if (updated.info.title.isNotBlank()) {
+                              library = library.map {
+                                  if (it.uri == item.uri) updated else it
+                              }
+                              saveLibrary(prefs, library)
+                          }
+                      }
+                      refreshing = false
+                      message = if (BuildConfig.TMDB_API_KEY.isBlank()) {
+                          "Add TMDB_API_KEY in GitHub Secrets to load movie metadata."
+                      } else {
+                          "Library metadata refreshed."
                       }
                   }
               }
@@ -643,155 +617,98 @@ jobs:
 
           @Composable
           private fun LibraryScreen(
-              library: List<VideoFile>,
-              statusMessage: String,
+              library: List<VideoEntry>,
+              message: String,
               onAdd: () -> Unit,
-              onPlay: (VideoFile) -> Unit,
-              onRemove: (VideoFile) -> Unit
+              onRefresh: () -> Unit,
+              onSelect: (VideoEntry) -> Unit,
+              onPlay: (VideoEntry) -> Unit
           ) {
-              val continueWatching = library.filter {
-                  it.position > 5000L &&
-                  (it.duration <= 0L || it.position < it.duration * 0.92)
-              }
-
               Column(
-                  modifier = Modifier
-                      .fillMaxSize()
-                      .background(BG)
-                      .padding(18.dp)
+                  Modifier.fillMaxSize().background(BG)
               ) {
                   Row(
-                      modifier = Modifier.fillMaxWidth(),
-                      verticalAlignment = Alignment.CenterVertically,
-                      horizontalArrangement = Arrangement.SpaceBetween
+                      Modifier.fillMaxWidth().padding(start = 20.dp, end = 12.dp, top = 20.dp, bottom = 14.dp),
+                      verticalAlignment = Alignment.CenterVertically
                   ) {
-                      Column {
-                          Text(
-                              "Infuse",
-                              color = Color.White,
-                              fontSize = 30.sp,
-                              fontWeight = FontWeight.Bold
-                          )
-                          Text(
-                              "PRO v3.1",
-                              color = ORANGE,
-                              fontSize = 12.sp
-                          )
+                      Column(Modifier.weight(1f)) {
+                          Text("Infuse", color = Color.White, fontSize = 30.sp, fontWeight = FontWeight.Bold)
+                          Text("YOUR CINEMA LIBRARY", color = MUTED, fontSize = 10.sp, letterSpacing = 2.sp)
                       }
-
                       Button(
                           onClick = onAdd,
-                          colors = ButtonDefaults.buttonColors(
-                              containerColor = ORANGE
-                          )
+                          colors = ButtonDefaults.buttonColors(containerColor = ACCENT),
+                          shape = RoundedCornerShape(12.dp)
                       ) {
-                          Icon(
-                              Icons.Default.Add,
-                              contentDescription = null
-                          )
+                          Icon(Icons.Default.Add, contentDescription = null)
                           Spacer(Modifier.width(5.dp))
                           Text("Open Video")
                       }
-                  }
-
-                  Spacer(Modifier.height(18.dp))
-
-                  HorizontalDivider(color = Color.DarkGray)
-
-                  Spacer(Modifier.height(14.dp))
-
-                  Text(
-                      "All Videos (${library.size})",
-                      color = Color.White,
-                      fontSize = 20.sp,
-                      fontWeight = FontWeight.SemiBold
-                  )
-
-                  if (statusMessage.isNotBlank()) {
-                      Spacer(Modifier.height(8.dp))
-                      Text(
-                          statusMessage,
-                          color = Color(0xFFB7BBC4),
-                          fontSize = 13.sp
-                      )
-                  }
-
-                  Spacer(Modifier.height(14.dp))
-
-                  if (continueWatching.isNotEmpty()) {
-                      Text(
-                          "Continue Watching",
-                          color = Color.White,
-                          fontSize = 19.sp,
-                          fontWeight = FontWeight.Bold
-                      )
-
-                      Spacer(Modifier.height(8.dp))
-
-                      continueWatching.forEach { video ->
-                          VideoCard(
-                              video = video,
-                              isResume = true,
-                              onPlay = { onPlay(video) },
-                              onRemove = { onRemove(video) }
-                          )
-                          Spacer(Modifier.height(10.dp))
+                      IconButton(onClick = onRefresh) {
+                          Icon(Icons.Default.Refresh, contentDescription = "Refresh metadata", tint = Color.White)
                       }
                   }
 
-                  Text(
-                      "My Library",
-                      color = Color.White,
-                      fontSize = 19.sp,
-                      fontWeight = FontWeight.Bold
-                  )
-
-                  Spacer(Modifier.height(10.dp))
+                  if (message.isNotBlank()) {
+                      Text(message, color = MUTED, fontSize = 12.sp, modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp))
+                  }
 
                   if (library.isEmpty()) {
-                      Box(
-                          modifier = Modifier.fillMaxSize(),
-                          contentAlignment = Alignment.Center
-                      ) {
-                          Column(
-                              horizontalAlignment = Alignment.CenterHorizontally
-                          ) {
-                              Text(
-                                  "Your library is empty",
-                                  color = Color.White,
-                                  fontSize = 18.sp
-                              )
+                      Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                          Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                              Text("Your library is empty", color = Color.White, fontSize = 21.sp, fontWeight = FontWeight.SemiBold)
                               Spacer(Modifier.height(8.dp))
-                              Text(
-                                  "Tap Open Video and select a video file.",
-                                  color = Color.Gray
-                              )
+                              Text("Add a movie or TV episode to get started", color = MUTED, fontSize = 13.sp)
                               Spacer(Modifier.height(18.dp))
-                              Button(
-                                  onClick = onAdd,
-                                  colors = ButtonDefaults.buttonColors(
-                                      containerColor = ORANGE
-                                  )
-                              ) {
+                              Button(onClick = onAdd, colors = ButtonDefaults.buttonColors(containerColor = ACCENT)) {
                                   Text("Choose Video")
                               }
                           }
                       }
                   } else {
-                      LazyColumn(
-                          modifier = Modifier.weight(1f),
-                          verticalArrangement = Arrangement.spacedBy(10.dp)
+                      val resume = library.filter { it.position > 5000L && !isComplete(it.position, it.duration) }
+                      if (resume.isNotEmpty()) {
+                          Text("Continue Watching", color = Color.White, fontSize = 19.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(start = 20.dp, top = 10.dp, bottom = 10.dp))
+                          androidx.compose.foundation.lazy.LazyRow(
+                              contentPadding = PaddingValues(horizontal = 20.dp),
+                              horizontalArrangement = Arrangement.spacedBy(12.dp)
+                          ) {
+                              items(resume, key = { it.uri.toString() }) { item ->
+                                  Column(Modifier.width(145.dp)) {
+                                      Poster(item, Modifier.fillMaxWidth().height(190.dp).clickable { onPlay(item) })
+                                      Text(item.info.title.ifBlank { item.fileName }, color = Color.White, maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 12.sp)
+                                      TextButton(onClick = { onPlay(item) }, contentPadding = PaddingValues(0.dp)) {
+                                          Text("▶ Resume", color = ACCENT)
+                                      }
+                                  }
+                              }
+                          }
+                      }
+
+                      Text("All Videos  (${library.size})", color = Color.White, fontSize = 19.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(start = 20.dp, top = 14.dp, bottom = 10.dp))
+
+                      LazyVerticalGrid(
+                          columns = GridCells.Adaptive(minSize = 112.dp),
+                          contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 24.dp),
+                          horizontalArrangement = Arrangement.spacedBy(12.dp),
+                          verticalArrangement = Arrangement.spacedBy(16.dp),
+                          modifier = Modifier.weight(1f)
                       ) {
-                          items(
-                              library,
-                              key = { it.uri.toString() }
-                          ) { video ->
-                              VideoCard(
-                                  video = video,
-                                  isResume = false,
-                                  onPlay = { onPlay(video) },
-                                  onRemove = { onRemove(video) }
-                              )
+                          items(library, key = { it.uri.toString() }) { item ->
+                              Column(Modifier.clickable { onSelect(item) }) {
+                                  Poster(item, Modifier.fillMaxWidth().height(174.dp))
+                                  Spacer(Modifier.height(7.dp))
+                                  Text(
+                                      item.info.title.ifBlank { item.fileName.substringBeforeLast(".") },
+                                      color = Color.White,
+                                      fontSize = 13.sp,
+                                      fontWeight = FontWeight.SemiBold,
+                                      maxLines = 2,
+                                      overflow = TextOverflow.Ellipsis
+                                  )
+                                  val meta = listOf(item.info.year, item.info.rating.takeIf { it.isNotBlank() }?.let { "★ $it" }).filterNotNull().filter { it.isNotBlank() }.joinToString("  •  ")
+                                  if (meta.isNotBlank()) Text(meta, color = MUTED, fontSize = 11.sp)
+                              }
                           }
                       }
                   }
@@ -799,217 +716,108 @@ jobs:
           }
 
           @Composable
-          private fun VideoCard(
-              video: VideoFile,
-              isResume: Boolean,
-              onPlay: () -> Unit,
-              onRemove: () -> Unit
-          ) {
-              Column(
-                  modifier = Modifier
-                      .fillMaxWidth()
-                      .background(PANEL, RoundedCornerShape(14.dp))
-                      .padding(14.dp)
-              ) {
-                  Row(
-                      verticalAlignment = Alignment.CenterVertically
-                  ) {
-                      Box(
-                          modifier = Modifier
-                              .size(48.dp)
-                              .background(
-                                  Color(0xFF30343B),
-                                  RoundedCornerShape(10.dp)
-                              ),
-                          contentAlignment = Alignment.Center
-                      ) {
-                          Icon(
-                              Icons.Default.PlayArrow,
-                              contentDescription = null,
-                              tint = Color.White
-                          )
+          private fun Poster(entry: VideoEntry, modifier: Modifier = Modifier) {
+              Box(modifier.clip(RoundedCornerShape(10.dp)).background(SURFACE)) {
+                  val image = entry.info.poster?.let { "https://image.tmdb.org/t/p/w500$it" }
+                  if (image != null) {
+                      AsyncImage(
+                          model = image,
+                          contentDescription = entry.info.title,
+                          contentScale = ContentScale.Crop,
+                          modifier = Modifier.fillMaxSize()
+                      )
+                  } else {
+                      Box(Modifier.fillMaxSize().background(Brush.linearGradient(listOf(Color(0xFF252A35), Color(0xFF111318)))), contentAlignment = Alignment.Center) {
+                          Text("INFUSE", color = Color(0xFF777D89), fontWeight = FontWeight.Bold, letterSpacing = 2.sp)
                       }
+                  }
+              }
+          }
 
-                      Spacer(Modifier.width(12.dp))
-
-                      Column(Modifier.weight(1f)) {
-                          Text(
-                              video.name,
-                              color = Color.White,
-                              fontWeight = FontWeight.SemiBold,
-                              maxLines = 2
-                          )
-
-                          if (isResume) {
-                              Text(
-                                  "Continue from ${formatTime(video.position)}",
-                                  color = Color.Gray,
-                                  fontSize = 12.sp
-                              )
+          @Composable
+          private fun MovieDetailsDialog(
+              entry: VideoEntry,
+              onDismiss: () -> Unit,
+              onPlay: () -> Unit
+          ) {
+              Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+                  Column(
+                      Modifier.fillMaxWidth(0.92f).clip(RoundedCornerShape(18.dp)).background(SURFACE)
+                  ) {
+                      Box(Modifier.fillMaxWidth().height(190.dp)) {
+                          val backdrop = entry.info.backdrop?.let { "https://image.tmdb.org/t/p/w780$it" }
+                          if (backdrop != null) {
+                              AsyncImage(backdrop, contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
+                          } else {
+                              Poster(entry, Modifier.fillMaxSize())
+                          }
+                          IconButton(onClick = onDismiss, modifier = Modifier.align(Alignment.TopEnd)) {
+                              Icon(Icons.Default.Close, contentDescription = "Close", tint = Color.White)
                           }
                       }
-
-                      TextButton(onClick = onRemove) {
-                          Text("Remove", color = Color.Gray)
+                      Column(Modifier.padding(18.dp)) {
+                          Text(entry.info.title.ifBlank { entry.fileName }, color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                          val line = listOf(entry.info.year, entry.info.genre, entry.info.rating.takeIf { it.isNotBlank() }?.let { "★ $it" }).filterNotNull().filter { it.isNotBlank() }.joinToString("  •  ")
+                          if (line.isNotBlank()) Text(line, color = MUTED, fontSize = 12.sp, modifier = Modifier.padding(top = 5.dp))
+                          Spacer(Modifier.height(12.dp))
+                          Text(entry.info.overview.ifBlank { "Metadata not found. Check the filename or configure your TMDB API key." }, color = Color(0xFFE0E1E5), fontSize = 14.sp, lineHeight = 20.sp)
+                          Spacer(Modifier.height(18.dp))
+                          Button(onClick = onPlay, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = ACCENT)) {
+                              Icon(Icons.Default.PlayArrow, contentDescription = null)
+                              Spacer(Modifier.width(7.dp))
+                              Text(if (entry.position > 5000L) "Resume" else "Play")
+                          }
                       }
-                  }
-
-                  if (video.duration > 0L && isResume) {
-                      Spacer(Modifier.height(10.dp))
-                      LinearProgressIndicator(
-                          progress = {
-                              (video.position.toFloat() /
-                                  video.duration.toFloat()).coerceIn(0f, 1f)
-                          },
-                          modifier = Modifier.fillMaxWidth(),
-                          color = ORANGE,
-                          trackColor = Color.DarkGray
-                      )
-                  }
-
-                  Spacer(Modifier.height(8.dp))
-
-                  Button(
-                      onClick = onPlay,
-                      modifier = Modifier.fillMaxWidth(),
-                      colors = ButtonDefaults.buttonColors(
-                          containerColor = ORANGE
-                      )
-                  ) {
-                      Icon(
-                          Icons.Default.PlayArrow,
-                          contentDescription = null
-                      )
-                      Spacer(Modifier.width(6.dp))
-                      Text(if (isResume) "Resume" else "Play")
                   }
               }
           }
 
           @Composable
           private fun PlayerScreen(
-              video: VideoFile,
+              entry: VideoEntry,
               player: ExoPlayer?,
+              position: Long,
+              duration: Long,
               audioCount: Int,
               subtitleCount: Int,
-              currentPosition: Long,
-              currentDuration: Long,
-              statusMessage: String,
+              message: String,
               onBack: () -> Unit,
               onAudio: () -> Unit,
-              onSubtitles: () -> Unit,
-              onAddSubtitle: () -> Unit
+              onSubs: () -> Unit,
+              onExternalSubs: () -> Unit
           ) {
-              Column(
-                  modifier = Modifier
-                      .fillMaxSize()
-                      .background(Color.Black)
-              ) {
+              Column(Modifier.fillMaxSize().background(Color.Black)) {
                   Row(
-                      modifier = Modifier
-                          .fillMaxWidth()
-                          .background(PANEL)
-                          .padding(horizontal = 8.dp),
+                      Modifier.fillMaxWidth().background(SURFACE).padding(horizontal = 8.dp),
                       verticalAlignment = Alignment.CenterVertically
                   ) {
                       IconButton(onClick = onBack) {
-                          Icon(
-                              Icons.Default.ArrowBack,
-                              contentDescription = "Back",
-                              tint = Color.White
-                          )
+                          Icon(Icons.Default.ArrowBack, contentDescription = "Back", tint = Color.White)
                       }
-
-                      Text(
-                          video.name,
-                          color = Color.White,
-                          modifier = Modifier.weight(1f),
-                          maxLines = 1
-                      )
+                      Text(entry.info.title.ifBlank { entry.fileName }, color = Color.White, maxLines = 1, overflow = TextOverflow.Ellipsis)
                   }
-
-                  Box(
-                      modifier = Modifier
-                          .fillMaxWidth()
-                          .weight(1f),
-                      contentAlignment = Alignment.Center
-                  ) {
+                  Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
                       if (player != null) {
                           key(player) {
                               AndroidView(
-                                  factory = { ctx ->
-                                      PlayerView(ctx).apply {
-                                          this.player = player
-                                          useController = true
-                                      }
-                                  },
-                                  update = { view ->
-                                      view.player = player
-                                  },
+                                  factory = { ctx -> PlayerView(ctx).apply { this.player = player; useController = true } },
+                                  update = { it.player = player },
                                   modifier = Modifier.fillMaxSize()
                               )
                           }
                       }
                   }
-
-                  Column(
-                      modifier = Modifier
-                          .fillMaxWidth()
-                          .background(PANEL)
-                          .padding(14.dp)
-                  ) {
-                      Text(
-                          video.name,
-                          color = Color.White,
-                          fontWeight = FontWeight.Bold
-                      )
-
-                      Spacer(Modifier.height(5.dp))
-
-                      Text(
-                          "${formatTime(currentPosition)} / ${formatTime(currentDuration)}",
-                          color = Color.Gray,
-                          fontSize = 12.sp
-                      )
-
-                      Spacer(Modifier.height(12.dp))
-
-                      Row(
-                          modifier = Modifier.fillMaxWidth(),
-                          horizontalArrangement = Arrangement.spacedBy(8.dp)
-                      ) {
-                          OutlinedButton(
-                              onClick = onAudio,
-                              modifier = Modifier.weight(1f)
-                          ) {
-                              Text("Audio ($audioCount)")
-                          }
-
-                          OutlinedButton(
-                              onClick = onSubtitles,
-                              modifier = Modifier.weight(1f)
-                          ) {
-                              Text("Subtitles ($subtitleCount)")
-                          }
+                  Column(Modifier.fillMaxWidth().background(SURFACE).padding(14.dp)) {
+                      Text("${clock(position)} / ${clock(duration)}", color = MUTED, fontSize = 12.sp)
+                      Spacer(Modifier.height(10.dp))
+                      Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                          OutlinedButton(onClick = onAudio, modifier = Modifier.weight(1f)) { Text("Audio ($audioCount)") }
+                          OutlinedButton(onClick = onSubs, modifier = Modifier.weight(1f)) { Text("Subtitles ($subtitleCount)") }
                       }
-
-                      Spacer(Modifier.height(6.dp))
-
-                      OutlinedButton(
-                          onClick = onAddSubtitle,
-                          modifier = Modifier.fillMaxWidth()
-                      ) {
-                          Text("Add external subtitle file")
+                      OutlinedButton(onClick = onExternalSubs, modifier = Modifier.fillMaxWidth()) {
+                          Text("Load external subtitle")
                       }
-
-                      if (statusMessage.isNotBlank()) {
-                          Spacer(Modifier.height(5.dp))
-                          Text(
-                              statusMessage,
-                              color = Color(0xFF8AB4F8),
-                              fontSize = 12.sp
-                          )
-                      }
+                      if (message.isNotBlank()) Text(message, color = MUTED, fontSize = 12.sp)
                   }
               }
           }
@@ -1017,10 +825,10 @@ jobs:
           @Composable
           private fun TrackDialog(
               title: String,
-              options: List<TrackOption>,
+              choices: List<TrackChoice>,
               onDismiss: () -> Unit,
               onOff: (() -> Unit)?,
-              onSelect: (TrackOption) -> Unit
+              onChoose: (TrackChoice) -> Unit
           ) {
               AlertDialog(
                   onDismissRequest = onDismiss,
@@ -1028,96 +836,100 @@ jobs:
                   text = {
                       Column {
                           if (onOff != null) {
-                              TextButton(
-                                  onClick = onOff,
-                                  modifier = Modifier.fillMaxWidth()
-                              ) {
-                                  Text("Turn subtitles off")
-                              }
+                              TextButton(onClick = onOff) { Text("Off") }
                           }
-
-                          if (options.isEmpty()) {
-                              Text(
-                                  "No tracks detected in this video.",
-                                  color = Color.Gray
-                              )
+                          if (choices.isEmpty()) {
+                              Text("No tracks detected in this file.")
                           } else {
-                              options.forEach { option ->
+                              choices.forEach { choice ->
                                   Row(
-                                      modifier = Modifier
-                                          .fillMaxWidth()
-                                          .clickable { onSelect(option) }
-                                          .padding(vertical = 8.dp),
+                                      Modifier.fillMaxWidth().clickable { onChoose(choice) }.padding(vertical = 6.dp),
                                       verticalAlignment = Alignment.CenterVertically
                                   ) {
-                                      RadioButton(
-                                          selected = option.selected,
-                                          onClick = { onSelect(option) }
-                                      )
+                                      RadioButton(selected = choice.selected, onClick = { onChoose(choice) })
                                       Spacer(Modifier.width(8.dp))
-                                      Text(option.title)
+                                      Text(choice.label)
                                   }
                               }
                           }
                       }
                   },
-                  confirmButton = {
-                      TextButton(onClick = onDismiss) {
-                          Text("Close")
-                      }
-                  }
+                  confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } }
               )
           }
 
-          private fun getTrackOptions(
-              tracks: Tracks,
-              type: Int
-          ): List<TrackOption> {
-              val result = mutableListOf<TrackOption>()
-
-              for (group in tracks.groups) {
-                  if (group.type != type) continue
-
-                  for (index in 0 until group.length) {
-                      val format = group.getTrackFormat(index)
-
-                      val language = format.language
-                          ?.takeIf { it.isNotBlank() && it != "und" }
-                          ?.let {
-                              Locale.forLanguageTag(it).getDisplayLanguage()
-                          }
-
-                      val label = format.label
-                          ?.takeIf { it.isNotBlank() }
-                          ?: language
-                          ?: if (type == C.TRACK_TYPE_AUDIO) {
-                              "Audio ${index + 1}"
-                          } else {
-                              "Subtitle ${index + 1}"
-                          }
-
-                      result.add(
-                          TrackOption(
-                              title = label,
-                              group = group,
-                              index = index,
-                              selected = group.isTrackSelected(index)
-                          )
-                      )
+          private fun getChoices(tracks: Tracks, type: Int): List<TrackChoice> {
+              val list = mutableListOf<TrackChoice>()
+              tracks.groups.filter { it.type == type }.forEach { group ->
+                  for (i in 0 until group.length) {
+                      val format = group.getTrackFormat(i)
+                      val lang = format.language?.takeIf { it != "und" && it.isNotBlank() }
+                          ?.let { Locale.forLanguageTag(it).getDisplayLanguage() }
+                      val label = format.label?.takeIf { it.isNotBlank() }
+                          ?: lang
+                          ?: if (type == C.TRACK_TYPE_AUDIO) "Audio track ${i + 1}" else "Subtitle ${i + 1}"
+                      list.add(TrackChoice(label, group, i, group.isTrackSelected(i)))
                   }
               }
-
-              return result
+              return list
           }
 
-          private fun subtitleMimeType(
-              name: String,
-              context: Context,
-              uri: Uri
-          ): String {
-              return when (
-                  name.substringAfterLast('.', "").lowercase(Locale.ROOT)
-              ) {
+          private suspend fun searchTmdb(fileName: String, apiKey: String): MovieInfo? {
+              val cleaned = fileName
+                  .substringBeforeLast(".")
+                  .replace(Regex("[._]"), " ")
+                  .replace(Regex("\\b(1080p|720p|2160p|4k|bluray|web-dl|webrip|hdtv|x264|x265|hevc|aac|dts)\\b", RegexOption.IGNORE_CASE), " ")
+                  .replace(Regex("\\s+"), " ")
+                  .trim()
+              if (cleaned.isBlank()) return null
+              val year = Regex("(19\\d{2}|20\\d{2})").find(cleaned)?.value
+              val query = URLEncoder.encode(cleaned, "UTF-8")
+              val url = "https://api.themoviedb.org/3/search/multi?api_key=$apiKey&query=$query"
+              return try {
+                  withContext(Dispatchers.IO) {
+                      val request = Request.Builder().url(url).get().build()
+                      http.newCall(request).execute().use { response ->
+                          if (!response.isSuccessful) return@withContext null
+                          val root = JSONObject(response.body?.string() ?: return@withContext null)
+                          val results = root.optJSONArray("results") ?: return@withContext null
+                          var best: JSONObject? = null
+                          for (i in 0 until results.length()) {
+                              val candidate = results.optJSONObject(i) ?: continue
+                              val type = candidate.optString("media_type")
+                              if (type != "movie" && type != "tv") continue
+                              val title = candidate.optString(if (type == "movie") "title" else "name")
+                              if (title.isBlank()) continue
+                              if (best == null) best = candidate
+                              if (year != null) {
+                                  val date = candidate.optString(if (type == "movie") "release_date" else "first_air_date")
+                                  if (date.startsWith(year)) {
+                                      best = candidate
+                                      break
+                                  }
+                              }
+                          }
+                          val item = best ?: return@withContext null
+                          val type = item.optString("media_type", "movie")
+                          val title = item.optString(if (type == "movie") "title" else "name")
+                          val date = item.optString(if (type == "movie") "release_date" else "first_air_date")
+                          MovieInfo(
+                              title = title,
+                              overview = item.optString("overview"),
+                              year = date.take(4),
+                              rating = if (item.has("vote_average")) String.format(Locale.US, "%.1f", item.optDouble("vote_average")) else "",
+                              poster = item.optString("poster_path").takeIf { it.isNotBlank() && it != "null" },
+                              backdrop = item.optString("backdrop_path").takeIf { it.isNotBlank() && it != "null" },
+                              mediaType = type
+                          )
+                      }
+                  }
+              } catch (_: Exception) {
+                  null
+              }
+          }
+
+          private fun subtitleMime(name: String, context: Context, uri: Uri): String {
+              return when (name.substringAfterLast('.', "").lowercase(Locale.ROOT)) {
                   "srt" -> MimeTypes.APPLICATION_SUBRIP
                   "vtt" -> MimeTypes.TEXT_VTT
                   "ass", "ssa" -> MimeTypes.TEXT_SSA
@@ -1132,104 +944,97 @@ jobs:
 
           private fun displayName(context: Context, uri: Uri): String {
               var name = uri.lastPathSegment ?: "Video"
-
               try {
                   context.contentResolver.query(
                       uri,
                       arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),
-                      null,
-                      null,
-                      null
+                      null, null, null
                   )?.use { cursor ->
                       if (cursor.moveToFirst()) {
-                          val index = cursor.getColumnIndex(
-                              android.provider.OpenableColumns.DISPLAY_NAME
-                          )
-                          if (index >= 0) {
-                              name = cursor.getString(index) ?: name
-                          }
+                          val index = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                          if (index >= 0) name = cursor.getString(index) ?: name
                       }
                   }
-              } catch (_: Exception) {
-              }
-
+              } catch (_: Exception) {}
               return name
           }
 
-          private fun loadLibrary(
-              prefs: android.content.SharedPreferences
-          ): List<VideoFile> {
+          private fun loadLibrary(prefs: android.content.SharedPreferences): List<VideoEntry> {
               val raw = prefs.getString("library", null) ?: return emptyList()
-
               return raw.split("\n").mapNotNull { line ->
                   val parts = line.split("|")
                   if (parts.size < 2) return@mapNotNull null
-
                   try {
                       val uri = Uri.parse(Uri.decode(parts[0]))
                       val name = Uri.decode(parts[1])
-
-                      VideoFile(
+                      val info = if (parts.size >= 8) {
+                          MovieInfo(
+                              title = Uri.decode(parts[2]),
+                              overview = Uri.decode(parts[3]),
+                              year = Uri.decode(parts[4]),
+                              rating = Uri.decode(parts[5]),
+                              poster = Uri.decode(parts[6]).takeIf { it.isNotBlank() },
+                              backdrop = Uri.decode(parts[7]).takeIf { it.isNotBlank() },
+                              genre = if (parts.size > 8) Uri.decode(parts[8]) else ""
+                          )
+                      } else MovieInfo()
+                      VideoEntry(
                           uri = uri,
-                          name = name,
-                          position = prefs.getLong("position_${uri}", 0L),
-                          duration = prefs.getLong("duration_${uri}", 0L)
+                          fileName = name,
+                          info = info,
+                          position = prefs.getLong("pos_${uri}", 0L),
+                          duration = prefs.getLong("dur_${uri}", 0L)
                       )
-                  } catch (_: Exception) {
-                      null
-                  }
+                  } catch (_: Exception) { null }
               }
           }
 
-          private fun saveLibrary(
-              prefs: android.content.SharedPreferences,
-              library: List<VideoFile>
-          ) {
-              val raw = library.joinToString("\n") {
-                  "${Uri.encode(it.uri.toString())}|${Uri.encode(it.name)}"
+          private fun saveLibrary(prefs: android.content.SharedPreferences, items: List<VideoEntry>) {
+              val raw = items.joinToString("\n") { item ->
+                  listOf(
+                      Uri.encode(item.uri.toString()),
+                      Uri.encode(item.fileName),
+                      Uri.encode(item.info.title),
+                      Uri.encode(item.info.overview),
+                      Uri.encode(item.info.year),
+                      Uri.encode(item.info.rating),
+                      Uri.encode(item.info.poster ?: ""),
+                      Uri.encode(item.info.backdrop ?: ""),
+                      Uri.encode(item.info.genre)
+                  ).joinToString("|")
               }
-
               prefs.edit().putString("library", raw).apply()
           }
 
-          private fun saveProgress(
+          private fun savePosition(
               prefs: android.content.SharedPreferences,
-              video: VideoFile,
+              entry: VideoEntry,
               position: Long,
               duration: Long
           ) {
-              val completed = duration > 0L &&
-                  position >= duration * 0.92
-
               prefs.edit()
-                  .putLong(
-                      "position_${video.uri}",
-                      if (completed) 0L else position.coerceAtLeast(0L)
-                  )
-                  .putLong(
-                      "duration_${video.uri}",
-                      duration.coerceAtLeast(0L)
-                  )
+                  .putLong("pos_${entry.uri}", if (isComplete(position, duration)) 0L else position.coerceAtLeast(0L))
+                  .putLong("dur_${entry.uri}", duration.coerceAtLeast(0L))
                   .apply()
           }
 
-          private fun formatTime(ms: Long): String {
+          private fun isComplete(position: Long, duration: Long): Boolean =
+              duration > 0L && position >= duration * 0.92
+
+          private fun clock(ms: Long): String {
               if (ms <= 0L) return "00:00"
-
-              val total = ms / 1000
-              val hours = total / 3600
-              val minutes = (total % 3600) / 60
-              val seconds = total % 60
-
-              return if (hours > 0) {
-                  "%02d:%02d:%02d".format(hours, minutes, seconds)
-              } else {
-                  "%02d:%02d".format(minutes, seconds)
-              }
+              val sec = ms / 1000
+              val h = sec / 3600
+              val m = (sec % 3600) / 60
+              val s = sec % 60
+              return if (h > 0) "%02d:%02d:%02d".format(h, m, s)
+              else "%02d:%02d".format(m, s)
           }
           EOF
 
-      - name: Build APK
+      - name: Build debug APK
+        env:
+          TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
         run: gradle --no-daemon :app:assembleDebug
 
       - name: Upload APK

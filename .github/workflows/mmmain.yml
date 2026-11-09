@@ -24,7 +24,7 @@ jobs:
         with:
           gradle-version: '8.8'
 
-      - name: Generate Full Local Video Scanner & Universal Player
+      - name: Generate Infuse v3.0 Universal Audio, Subtitles, Resume & MediaExtractor
         run: |
           rm -rf app/src/main/java *.kt
           mkdir -p app/src/main/java/com/infuse/player/data/model
@@ -94,17 +94,25 @@ jobs:
               val rating: String = "8.5",
               val qualityTag: String = "HD",
               val resolution: String = "1920x1080",
-              val audioSpec: String = "Multi-Track Audio",
-              val videoCodec: String = "Hardware Direct",
-              val container: String = "MKV / MP4",
+              val frameRate: String = "24 fps",
+              val hdrFormat: String = "SDR (8-bit)",
+              val audioSpec: String = "AAC Stereo",
+              val audioDetails: String = "48.0 kHz • 2 Channels",
+              val videoCodec: String = "H.264 / AVC",
+              val container: String = "MKV",
               val bitrate: String = "--",
               val fileSize: String = "--",
+              val subtitleSummary: String = "None detected",
               val streamUri: String,
               val posterUrl: String = "",
               val backdropUrl: String = "",
               val synopsis: String = "Scanning metadata...",
+              val savedPositionMs: Long = 0L,
               val isWatched: Boolean = false
-          )
+          ) {
+              val progressFraction: Float
+                  get() = if (durationSeconds > 0) (savedPositionMs.toFloat() / (durationSeconds * 1000f)).coerceIn(0f, 1f) else 0f
+          }
           EOF
 
           cat << 'EOF' > app/src/main/java/com/infuse/player/data/scraper/FilenameParser.kt
@@ -112,11 +120,11 @@ jobs:
 
           object FilenameParser {
               private val TV_REGEX = Regex("(?i)[._ -]S(\\d{1,2})[._ -]?E(\\d{1,3})")
-              private val YEAR_REGEX = Regex("[._ -]\\(?((?:19|20)\\d{2})\\)?")
+              private val YEAR_REGEX = Regex("[._ -]\\(?((?:19\vert{}20)\\d{2})\\)?")
               private val TAGS = listOf(
                   "2160p", "1080p", "720p", "480p", "4k", "uhd", "hdr", "hdr10", "dv", "dovi",
                   "remux", "bluray", "bdrip", "web-dl", "webrip", "hdtv", "x264", "x265",
-                  "h264", "h265", "hevc", "av1", "10bit", "truehd", "atmos", "dts", "ac3", "aac"
+                  "h264", "h265", "hevc", "av1", "10bit", "truehd", "atmos", "dts", "ac3", "eac3", "aac"
               )
 
               data class ParsedInfo(val cleanTitle: String, val year: Int?, val isTv: Boolean)
@@ -197,7 +205,7 @@ jobs:
                   item.copy(
                       title = parsed.cleanTitle,
                       year = parsed.year ?: item.year,
-                      synopsis = "Local video file (${item.rawFilename}) • Resolution: ${item.resolution} • Size: ${item.fileSize}"
+                      synopsis = "Local video (${item.rawFilename}) •${item.resolution} • ${item.videoCodec} •${item.audioSpec}"
                   )
               }
           }
@@ -208,6 +216,8 @@ jobs:
 
           import android.content.ContentUris
           import android.content.Context
+          import android.media.MediaExtractor
+          import android.media.MediaFormat
           import android.media.MediaMetadataRetriever
           import android.net.Uri
           import android.provider.MediaStore
@@ -225,12 +235,30 @@ jobs:
           class MediaRepository(private val context: Context) {
               private val scraper = TmdbScraperService()
               private val scope = CoroutineScope(Dispatchers.IO)
+              private val prefs = context.getSharedPreferences("infuse_playback_state", Context.MODE_PRIVATE)
 
               private val _mediaList = MutableStateFlow<List<MediaItem>>(emptyList())
               val mediaList: StateFlow<List<MediaItem>> = _mediaList.asStateFlow()
 
               private val _isScanning = MutableStateFlow(false)
               val isScanning: StateFlow<Boolean> = _isScanning.asStateFlow()
+
+              fun savePlaybackPosition(streamUri: String, positionMs: Long, durationMs: Long) {
+                  prefs.edit().putLong("pos_$streamUri", positionMs).apply()
+                  val watched = durationMs > 0 && positionMs >= (durationMs * 0.92)
+                  if (watched) {
+                      prefs.edit().putBoolean("watched_$streamUri", true).apply()
+                  }
+                  _mediaList.value = _mediaList.value.map {
+                      if (it.streamUri == streamUri) {
+                          it.copy(savedPositionMs = positionMs, isWatched = watched || it.isWatched)
+                      } else it
+                  }
+              }
+
+              fun getSavedPosition(streamUri: String): Long {
+                  return prefs.getLong("pos_$streamUri", 0L)
+              }
 
               fun scanDeviceVideos() {
                   scope.launch {
@@ -242,8 +270,7 @@ jobs:
                           MediaStore.Video.Media.DURATION,
                           MediaStore.Video.Media.SIZE,
                           MediaStore.Video.Media.WIDTH,
-                          MediaStore.Video.Media.HEIGHT,
-                          MediaStore.Video.Media.MIME_TYPE
+                          MediaStore.Video.Media.HEIGHT
                       )
                       val sortOrder = "${MediaStore.Video.Media.DATE_ADDED} DESC"
 
@@ -261,7 +288,6 @@ jobs:
                               val sizeCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.SIZE)
                               val widthCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.WIDTH)
                               val heightCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.HEIGHT)
-                              val mimeCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.MIME_TYPE)
 
                               while (cursor.moveToNext()) {
                                   val id = cursor.getLong(idCol)
@@ -270,18 +296,16 @@ jobs:
                                   val sizeBytes = cursor.getLong(sizeCol)
                                   val w = cursor.getInt(widthCol)
                                   val h = cursor.getInt(heightCol)
-                                  val mime = cursor.getString(mimeCol) ?: "video/mp4"
                                   val contentUri = ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, id)
 
-                                  val baseItem = createMediaItemFromSpecs(
+                                  val baseItem = inspectTrackFormatsAndCreateItem(
                                       id = "local_$id",
                                       name = name,
-                                      uri = contentUri.toString(),
-                                      durationMs = durationMs,
+                                      uri = contentUri,
+                                      fallbackDurationMs = durationMs,
                                       sizeBytes = sizeBytes,
-                                      width = w,
-                                      height = h,
-                                      mime = mime
+                                      fallbackW = w,
+                                      fallbackH = h
                                   )
                                   discovered.add(baseItem)
                               }
@@ -293,7 +317,6 @@ jobs:
                       }
                       _mediaList.value = discovered
 
-                      // Enrich each video asynchronously with TMDb Posters & Plot Metadata
                       val enrichedList = discovered.toMutableList()
                       for (i in enrichedList.indices) {
                           val enriched = scraper.enrichWithMetadata(enrichedList[i])
@@ -306,7 +329,7 @@ jobs:
 
               fun addPickedVideoUri(uri: Uri, onReady: (MediaItem) -> Unit) {
                   scope.launch {
-                      var displayName = "Picked_Video.mp4"
+                      var displayName = "Local_Video.mkv"
                       var sizeBytes = 0L
                       try {
                           context.contentResolver.query(uri, null, null, null, null)?.use { c ->
@@ -319,38 +342,17 @@ jobs:
                           }
                       } catch (_: Exception) {}
 
-                      var durationMs = 0L
-                      var width = 1920
-                      var height = 1080
-                      var bitrateBps = 0L
-                      var mime = "video/*"
-
-                      val retriever = MediaMetadataRetriever()
-                      try {
-                          retriever.setDataSource(context, uri)
-                          durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
-                          width = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 1920
-                          height = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 1080
-                          bitrateBps = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)?.toLongOrNull() ?: 0L
-                          mime = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_MIMETYPE) ?: "video/mp4"
-                      } catch (_: Exception) {
-                      } finally {
-                          try { retriever.release() } catch (_: Exception) {}
-                      }
-
-                      val rawItem = createMediaItemFromSpecs(
+                      val rawItem = inspectTrackFormatsAndCreateItem(
                           id = "picked_${System.currentTimeMillis()}",
                           name = displayName,
-                          uri = uri.toString(),
-                          durationMs = durationMs,
+                          uri = uri,
+                          fallbackDurationMs = 0L,
                           sizeBytes = sizeBytes,
-                          width = width,
-                          height = height,
-                          mime = mime,
-                          bitrateBps = bitrateBps
+                          fallbackW = 1920,
+                          fallbackH = 1080
                       )
                       val enriched = scraper.enrichWithMetadata(rawItem)
-                      _mediaList.value = listOf(enriched) + _mediaList.value
+                      _mediaList.value = listOf(enriched) + _mediaList.value.filter { it.streamUri != enriched.streamUri }
                       kotlinx.coroutines.withContext(Dispatchers.Main) {
                           onReady(enriched)
                       }
@@ -359,42 +361,141 @@ jobs:
 
               fun toggleWatched(id: String) {
                   _mediaList.value = _mediaList.value.map {
-                      if (it.id == id) it.copy(isWatched = !it.isWatched) else it
+                      if (it.id == id) {
+                          val nextWatched = !it.isWatched
+                          prefs.edit().putBoolean("watched_${it.streamUri}", nextWatched).apply()
+                          if (!nextWatched) prefs.edit().putLong("pos_${it.streamUri}", 0L).apply()
+                          it.copy(isWatched = nextWatched, savedPositionMs = if (!nextWatched) 0L else it.savedPositionMs)
+                      } else it
                   }
               }
 
-              private fun createMediaItemFromSpecs(
+              private fun inspectTrackFormatsAndCreateItem(
                   id: String,
                   name: String,
-                  uri: String,
-                  durationMs: Long,
+                  uri: Uri,
+                  fallbackDurationMs: Long,
                   sizeBytes: Long,
-                  width: Int,
-                  height: Int,
-                  mime: String,
-                  bitrateBps: Long = 0L
+                  fallbackW: Int,
+                  fallbackH: Int
               ): MediaItem {
+                  var durationMs = fallbackDurationMs
+                  var width = fallbackW
+                  var height = fallbackH
+                  var bitrateBps = 0L
+
+                  val retriever = MediaMetadataRetriever()
+                  try {
+                      retriever.setDataSource(context, uri)
+                      if (durationMs <= 0L) {
+                          durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+                      }
+                      val rw = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull()
+                      val rh = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull()
+                      if (rw != null && rw > 0) width = rw
+                      if (rh != null && rh > 0) height = rh
+                      bitrateBps = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)?.toLongOrNull() ?: 0L
+                  } catch (_: Exception) {
+                  } finally {
+                      try { retriever.release() } catch (_: Exception) {}
+                  }
+
+                  var vCodecName = "H.264 / AVC"
+                  var frameRateStr = "24 fps"
+                  var hdrStr = "SDR (8-bit)"
+                  var aCodecName = "AAC Audio"
+                  var aDetailStr = "48.0 kHz • Stereo"
+                  val audioTracksFound = mutableListOf<String>()
+                  val subTracksFound = mutableListOf<String>()
+
+                  val extractor = MediaExtractor()
+                  try {
+                      extractor.setDataSource(context, uri, null)
+                      for (i in 0 until extractor.trackCount) {
+                          val format = extractor.getTrackFormat(i)
+                          val mime = format.getString(MediaFormat.KEY_MIME) ?: ""
+                          val lang = if (format.containsKey(MediaFormat.KEY_LANGUAGE)) format.getString(MediaFormat.KEY_LANGUAGE) ?: "und" else "und"
+
+                          if (mime.startsWith("video/")) {
+                              vCodecName = formatFriendlyCodec(mime)
+                              if (format.containsKey(MediaFormat.KEY_FRAME_RATE)) {
+                                  try {
+                                      val fr = format.getInteger(MediaFormat.KEY_FRAME_RATE)
+                                      frameRateStr = "$fr fps"
+                                  } catch (_: Exception) {}
+                              }
+                              if (format.containsKey(MediaFormat.KEY_COLOR_TRANSFER)) {
+                                  val ct = format.getInteger(MediaFormat.KEY_COLOR_TRANSFER)
+                                  hdrStr = when (ct) {
+                                      6 -> "HDR10 (PQ 10-bit)"
+                                      7 -> "HLG HDR"
+                                      else -> "SDR (Rec.709)"
+                                  }
+                              }
+                          } else if (mime.startsWith("audio/")) {
+                              val friendlyAudio = formatFriendlyCodec(mime)
+                              val ch = if (format.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) format.getInteger(MediaFormat.KEY_CHANNEL_COUNT) else 2
+                              val sr = if (format.containsKey(MediaFormat.KEY_SAMPLE_RATE)) format.getInteger(MediaFormat.KEY_SAMPLE_RATE) else 48000
+                              val chLayout = when (ch) {
+                                  1 -> "Mono 1.0"
+                                  2 -> "Stereo 2.0"
+                                  6 -> "Surround 5.1"
+                                  8 -> "Surround 7.1"
+                                  else -> "$ch Channels"
+                              }
+                              if (audioTracksFound.isEmpty()) {
+                                  aCodecName = "$friendlyAudio ($chLayout)"
+                                  aDetailStr = "${String.format(Locale.US, "%.1f", sr / 1000.0)} kHz • $chLayout • ${lang.uppercase()}"
+                              }
+                              audioTracksFound.add("$friendlyAudio $chLayout (${lang.uppercase()})")
+                          } else if (mime.startsWith("text/") || mime.contains("cea") || mime.contains("subrip") || mime.contains("ssa") || mime.contains("vtt") || mime.contains("pgs")) {
+                              subTracksFound.add("${lang.uppercase()} (${formatFriendlyCodec(mime)})")
+                          }
+                      }
+                  } catch (_: Exception) {
+                  } finally {
+                      try { extractor.release() } catch (_: Exception) {}
+                  }
+
+                  val ext = name.substringAfterLast(".", "MKV").uppercase(Locale.ROOT)
+                  val containerName = when (ext) {
+                      "MKV" -> "Matroska (MKV)"
+                      "MP4", "M4V" -> "MPEG-4 (MP4)"
+                      "AVI" -> "Audio Video Interleave (AVI)"
+                      "TS", "M2TS" -> "MPEG Transport Stream (TS)"
+                      "WEBM" -> "WebM Media"
+                      "MOV" -> "QuickTime (MOV)"
+                      else -> ext
+                  }
+
                   val quality = when {
                       width >= 3800 || height >= 2100 -> "4K UHD"
+                      width >= 2500 || height >= 1400 -> "1440p QHD"
                       width >= 1900 || height >= 1000 -> "1080p FHD"
                       width >= 1200 || height >= 700 -> "720p HD"
                       else -> "SD Direct"
                   }
-                  val ext = name.substringAfterLast(".", "MP4").uppercase(Locale.ROOT)
-                  val sizeMb = if (sizeBytes > 0) String.format(Locale.US, "%.1f MB", sizeBytes / (1024.0 * 1024.0)) else "Direct Stream"
+
+                  val sizeText = if (sizeBytes >= 1024L * 1024L * 1024L) {
+                      String.format(Locale.US, "%.2f GB", sizeBytes / (1024.0 * 1024.0 * 1024.0))
+                  } else if (sizeBytes > 0) {
+                      String.format(Locale.US, "%.1f MB", sizeBytes / (1024.0 * 1024.0))
+                  } else "Direct Stream"
+
                   val calcBitrate = if (bitrateBps > 0) {
                       String.format(Locale.US, "%.1f Mbps", bitrateBps / 1_000_000.0)
                   } else if (durationMs > 0 && sizeBytes > 0) {
                       val bps = (sizeBytes * 8.0) / (durationMs / 1000.0)
                       String.format(Locale.US, "%.1f Mbps", bps / 1_000_000.0)
-                  } else {
-                      "Variable Bitrate"
-                  }
+                  } else "Variable"
 
                   val totalSecs = durationMs / 1000
                   val hrs = totalSecs / 3600
                   val mins = (totalSecs % 3600) / 60
-                  val durText = if (hrs > 0) "${hrs}h ${mins}m" else "${mins}m ${(totalSecs % 60)}s"
+                  val durText = if (hrs > 0) "${hrs}h${mins}m" else "${mins}m${(totalSecs % 60)}s"
+
+                  val savedPos = prefs.getLong("pos_$uri", 0L)
+                  val savedWatched = prefs.getBoolean("watched_$uri", false)
 
                   return MediaItem(
                       id = id,
@@ -405,927 +506,15 @@ jobs:
                       durationSeconds = totalSecs,
                       rating = "Local",
                       qualityTag = quality,
-                      resolution = if (width > 0 && height > 0) "${width}x${height}" else "Auto",
-                      audioSpec = "Direct Hardware Audio",
-                      videoCodec = "$mime ($ext)",
-                      container = ext,
+                      resolution = "${width}x${height}",
+                      frameRate = frameRateStr,
+                      hdrFormat = hdrStr,
+                      audioSpec = aCodecName,
+                      audioDetails = if (audioTracksFound.size > 1) "$aDetailStr (+${audioTracksFound.size - 1} more)" else aDetailStr,
+                      videoCodec = vCodecName,
+                      container = containerName,
                       bitrate = calcBitrate,
-                      fileSize = sizeMb,
-                      streamUri = uri,
-                      posterUrl = "https://images.unsplash.com/photo-1489599849927-2ee91cede3ba?w=600&q=80",
-                      backdropUrl = "https://images.unsplash.com/photo-1518709268805-4e9042af9f23?w=1200&q=80",
-                      synopsis = "Local video file: $name"
-                  )
-              }
-
-              private fun defaultDemoSamples(): List<MediaItem> = listOf(
-                  MediaItem(
-                      id = "demo_1",
-                      title = "Big Buck Bunny",
-                      rawFilename = "Big.Buck.Bunny.2008.1080p.BluRay.x264.mp4",
-                      year = 2008,
-                      durationText = "9m 56s",
-                      durationSeconds = 596,
-                      rating = "8.1",
-                      qualityTag = "1080p FHD",
-                      resolution = "1920x1080",
-                      audioSpec = "AAC 5.1 Surround",
-                      videoCodec = "AVC1 High@L4.1",
-                      container = "MP4",
-                      bitrate = "5.2 Mbps",
-                      fileSize = "158 MB",
-                      streamUri = "https://storage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4",
-                      posterUrl = "https://images.unsplash.com/photo-1451187580459-43490279c0fa?w=600&q=80",
-                      backdropUrl = "https://images.unsplash.com/photo-1506703719100-a0f3a48c0f86?w=1200&q=80",
-                      synopsis = "Tap Open Video in the top bar or grant storage permissions to scan and play all local videos on your phone with automatic TMDb metadata!"
-                  )
-              )
-          }
-          EOF
-
-          cat << 'EOF' > app/src/main/java/com/infuse/player/ui/theme/Theme.kt
-          package com.infuse.player.ui.theme
-
-          import androidx.compose.material3.MaterialTheme
-          import androidx.compose.material3.darkColorScheme
-          import androidx.compose.runtime.Composable
-          import androidx.compose.ui.graphics.Color
-
-          private val DarkColorScheme = darkColorScheme(
-              primary = Color(0xFFF97316),
-              secondary = Color(0xFFF59E0B),
-              background = Color(0xFF0B0C0F),
-              surface = Color(0xFF13151B),
-              onPrimary = Color.White,
-              onBackground = Color(0xFFF3F4F6),
-              onSurface = Color(0xFFF3F4F6)
-          )
-
-          @Composable
-          fun InfuseTheme(content: @Composable () -> Unit) {
-              MaterialTheme(colorScheme = DarkColorScheme, content = content)
-          }
-          EOF
-
-          cat << 'EOF' > app/src/main/java/com/infuse/player/ui/library/MediaDetailSheet.kt
-          package com.infuse.player.ui.library
-
-          import androidx.compose.foundation.layout.*
-          import androidx.compose.foundation.shape.RoundedCornerShape
-          import androidx.compose.material.icons.Icons
-          import androidx.compose.material.icons.filled.CheckCircle
-          import androidx.compose.material.icons.filled.PlayArrow
-          import androidx.compose.material3.*
-          import androidx.compose.runtime.Composable
-          import androidx.compose.ui.Modifier
-          import androidx.compose.ui.draw.clip
-          import androidx.compose.ui.graphics.Color
-          import androidx.compose.ui.layout.ContentScale
-          import androidx.compose.ui.text.font.FontWeight
-          import androidx.compose.ui.unit.dp
-          import androidx.compose.ui.unit.sp
-          import coil.compose.AsyncImage
-          import com.infuse.player.data.model.MediaItem
-
-          @OptIn(ExperimentalMaterial3Api::class)
-          @Composable
-          fun MediaDetailSheet(
-              media: MediaItem,
-              onDismiss: () -> Unit,
-              onPlay: () -> Unit,
-              onToggleWatched: () -> Unit
-          ) {
-              ModalBottomSheet(
-                  onDismissRequest = onDismiss,
-                  containerColor = Color(0xFF13151B)
-              ) {
-                  Column(
-                      modifier = Modifier
-                          .fillMaxWidth()
-                          .padding(20.dp),
-                      verticalArrangement = Arrangement.spacedBy(14.dp)
-                  ) {
-                      Row(
-                          modifier = Modifier.fillMaxWidth(),
-                          horizontalArrangement = Arrangement.spacedBy(16.dp)
-                      ) {
-                          AsyncImage(
-                              model = media.posterUrl,
-                              contentDescription = null,
-                              modifier = Modifier
-                                  .width(95.dp)
-                                  .aspectRatio(2f / 3f)
-                                  .clip(RoundedCornerShape(10.dp)),
-                              contentScale = ContentScale.Crop
-                          )
-                          Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
-                              Text(media.title, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 18.sp)
-                              Text("${media.year} • ${media.durationText} • ★ ${media.rating}", color = Color.LightGray, fontSize = 12.sp)
-                              Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                  Badge(containerColor = Color(0x33F97316), contentColor = Color(0xFFF97316)) {
-                                      Text(media.qualityTag, fontSize = 10.sp)
-                                  }
-                                  Badge(containerColor = Color(0x3338BDF8), contentColor = Color(0xFF38BDF8)) {
-                                      Text(media.container, fontSize = 10.sp)
-                                  }
-                              }
-                              if (media.rawFilename.isNotEmpty()) {
-                                  Text(media.rawFilename, color = Color.Gray, fontSize = 11.sp, maxLines = 1)
-                              }
-                          }
-                      }
-
-                      Text(media.synopsis, color = Color(0xFFD1D5DB), fontSize = 13.sp, lineHeight = 18.sp)
-
-                      Card(
-                          colors = CardDefaults.cardColors(containerColor = Color(0xFF1A1D26)),
-                          shape = RoundedCornerShape(12.dp)
-                      ) {
-                          Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                              Text("REAL-TIME VIDEO & STREAM METADATA", color = Color(0xFFF97316), fontSize = 10.sp, fontWeight = FontWeight.Bold)
-                              Text("Resolution: ${media.resolution} (${media.qualityTag})", color = Color.White, fontSize = 12.sp)
-                              Text("Format / Codec: ${media.videoCodec}", color = Color.White, fontSize = 12.sp)
-                              Text("Bitrate: ${media.bitrate} • File Size: ${media.fileSize}", color = Color.White, fontSize = 12.sp)
-                          }
-                      }
-
-                      Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                          Button(
-                              onClick = onPlay,
-                              modifier = Modifier.weight(1f),
-                              colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF97316)),
-                              shape = RoundedCornerShape(12.dp)
-                          ) {
-                              Icon(Icons.Default.PlayArrow, contentDescription = null)
-                              Spacer(modifier = Modifier.width(6.dp))
-                              Text("Play Video")
-                          }
-                          OutlinedButton(
-                              onClick = onToggleWatched,
-                              modifier = Modifier.weight(1f),
-                              shape = RoundedCornerShape(12.dp)
-                          ) {
-                              Icon(Icons.Default.CheckCircle, contentDescription = null, tint = if (media.isWatched) Color(0xFF34D399) else Color.Gray)
-                              Spacer(modifier = Modifier.width(6.dp))
-                              Text(if (media.isWatched) "Watched" else "Mark Watched", color = Color.White)
-                          }
-                      }
-                  }
-              }
-          }
-          EOF
-
-          cat << 'EOF' > app/src/main/java/com/infuse/player/ui/library/LibraryScreen.kt
-          package com.infuse.player.ui.library
-
-          import androidx.compose.foundation.background
-          import androidx.compose.foundation.clickable
-          import androidx.compose.foundation.layout.*
-          import androidx.compose.foundation.lazy.grid.GridCells
-          import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-          import androidx.compose.foundation.lazy.grid.items
-          import androidx.compose.foundation.shape.RoundedCornerShape
-          import androidx.compose.material.icons.Icons
-          import androidx.compose.material.icons.filled.FolderOpen
-          import androidx.compose.material.icons.filled.PlayArrow
-          import androidx.compose.material.icons.filled.Refresh
-          import androidx.compose.material3.*
-          import androidx.compose.runtime.*
-          import androidx.compose.ui.Alignment
-          import androidx.compose.ui.Modifier
-          import androidx.compose.ui.draw.clip
-          import androidx.compose.ui.graphics.Brush
-          import androidx.compose.ui.graphics.Color
-          import androidx.compose.ui.layout.ContentScale
-          import androidx.compose.ui.text.font.FontWeight
-          import androidx.compose.ui.text.style.TextOverflow
-          import androidx.compose.ui.unit.dp
-          import androidx.compose.ui.unit.sp
-          import coil.compose.AsyncImage
-          import com.infuse.player.data.model.MediaItem
-          import com.infuse.player.data.repository.MediaRepository
-
-          @OptIn(ExperimentalMaterial3Api::class)
-          @Composable
-          fun LibraryScreen(
-              repository: MediaRepository,
-              onMediaSelected: (MediaItem) -> Unit,
-              onPickLocalFile: () -> Unit,
-              onRescanStorage: () -> Unit
-          ) {
-              val mediaList by repository.mediaList.collectAsState()
-              val isScanning by repository.isScanning.collectAsState()
-              var selectedItemForDetail by remember { mutableStateOf<MediaItem?>(null) }
-
-              Scaffold(
-                  topBar = {
-                      TopAppBar(
-                          title = {
-                              Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                  Text("Infuse", fontWeight = FontWeight.Bold, color = Color.White)
-                                  Badge(containerColor = Color(0x33F97316), contentColor = Color(0xFFF97316)) {
-                                      Text("LOCAL & CLOUD", fontSize = 9.sp, fontWeight = FontWeight.Bold)
-                                  }
-                              }
-                          },
-                          actions = {
-                              Button(
-                                  onClick = onPickLocalFile,
-                                  colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF97316)),
-                                  shape = RoundedCornerShape(10.dp),
-                                  contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
-                              ) {
-                                  Icon(Icons.Default.FolderOpen, contentDescription = "Open File", modifier = Modifier.size(16.dp))
-                                  Spacer(modifier = Modifier.width(6.dp))
-                                  Text("Open Video", fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                              }
-                              IconButton(onClick = onRescanStorage) {
-                                  Icon(Icons.Default.Refresh, contentDescription = "Scan Storage", tint = Color.LightGray)
-                              }
-                          },
-                          colors = TopAppBarDefaults.topAppBarColors(containerColor = Color(0xFF0B0C0F))
-                      )
-                  },
-                  containerColor = Color(0xFF0B0C0F)
-              ) { padding ->
-                  Column(
-                      modifier = Modifier
-                          .fillMaxSize()
-                          .padding(padding)
-                          .padding(horizontal = 16.dp)
-                  ) {
-                      if (isScanning) {
-                          LinearProgressIndicator(
-                              modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
-                              color = Color(0xFFF97316)
-                          )
-                      }
-
-                      if (mediaList.isNotEmpty()) {
-                          val featured = mediaList.first()
-                          Card(
-                              modifier = Modifier
-                                  .fillMaxWidth()
-                                  .height(190.dp)
-                                  .clip(RoundedCornerShape(16.dp)),
-                              colors = CardDefaults.cardColors(containerColor = Color(0xFF13151B))
-                          ) {
-                              Box(modifier = Modifier.fillMaxSize()) {
-                                  AsyncImage(
-                                      model = featured.backdropUrl,
-                                      contentDescription = null,
-                                      contentScale = ContentScale.Crop,
-                                      modifier = Modifier.fillMaxSize()
-                                  )
-                                  Box(
-                                      modifier = Modifier
-                                          .fillMaxSize()
-                                          .background(Brush.verticalGradient(listOf(Color.Transparent, Color(0xFF0B0C0F))))
-                                  )
-                                  Column(
-                                      modifier = Modifier.align(Alignment.BottomStart).padding(16.dp)
-                                  ) {
-                                      Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                          Badge(containerColor = Color(0xFFF59E0B), contentColor = Color.Black) {
-                                              Text(featured.qualityTag, fontSize = 9.sp, fontWeight = FontWeight.Black)
-                                          }
-                                          Badge(containerColor = Color(0x3338BDF8), contentColor = Color(0xFF38BDF8)) {
-                                              Text(featured.resolution, fontSize = 9.sp, fontWeight = FontWeight.Bold)
-                                          }
-                                      }
-                                      Spacer(modifier = Modifier.height(4.dp))
-                                      Text(featured.title, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 18.sp, maxLines = 1)
-                                      Spacer(modifier = Modifier.height(8.dp))
-                                      Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                          Button(
-                                              onClick = { onMediaSelected(featured) },
-                                              colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF97316)),
-                                              shape = RoundedCornerShape(10.dp)
-                                          ) {
-                                              Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(16.dp))
-                                              Spacer(modifier = Modifier.width(4.dp))
-                                              Text("Play Now", fontSize = 12.sp)
-                                          }
-                                          OutlinedButton(
-                                              onClick = { selectedItemForDetail = featured },
-                                              shape = RoundedCornerShape(10.dp)
-                                          ) {
-                                              Text("Metadata & Specs", fontSize = 12.sp, color = Color.White)
-                                          }
-                                      }
-                                  }
-                              }
-                          }
-                          Spacer(modifier = Modifier.height(16.dp))
-                      }
-
-                      Row(
-                          modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
-                          horizontalArrangement = Arrangement.SpaceBetween,
-                          verticalAlignment = Alignment.CenterVertically
-                      ) {
-                          Text("Your Video Library (${mediaList.size})", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                          Text("Tap poster for metadata", color = Color.Gray, fontSize = 12.sp)
-                      }
-
-                      LazyVerticalGrid(
-                          columns = GridCells.Adaptive(minSize = 125.dp),
-                          horizontalArrangement = Arrangement.spacedBy(12.dp),
-                          verticalArrangement = Arrangement.spacedBy(16.dp),
-                          contentPadding = PaddingValues(bottom = 24.dp)
-                      ) {
-                          items(mediaList) { item ->
-                              Column(
-                                  modifier = Modifier.fillMaxWidth().clickable { selectedItemForDetail = item }
-                              ) {
-                                  Card(
-                                      shape = RoundedCornerShape(12.dp),
-                                      modifier = Modifier.fillMaxWidth().aspectRatio(2f / 3f)
-                                  ) {
-                                      Box(modifier = Modifier.fillMaxSize()) {
-                                          AsyncImage(
-                                              model = item.posterUrl,
-                                              contentDescription = item.title,
-                                              contentScale = ContentScale.Crop,
-                                              modifier = Modifier.fillMaxSize()
-                                          )
-                                          Badge(
-                                              containerColor = Color.Black.copy(alpha = 0.75f),
-                                              contentColor = Color(0xFFF97316),
-                                              modifier = Modifier.align(Alignment.TopStart).padding(6.dp)
-                                          ) {
-                                              Text(item.qualityTag, fontSize = 8.sp, fontWeight = FontWeight.Bold)
-                                          }
-                                      }
-                                  }
-                                  Spacer(modifier = Modifier.height(4.dp))
-                                  Text(item.title, color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                  Text("${item.container} • ${item.durationText}", color = Color.Gray, fontSize = 11.sp)
-                              }
-                          }
-                      }
-                  }
-              }
-
-              selectedItemForDetail?.let { item ->
-                  MediaDetailSheet(
-                      media = item,
-                      onDismiss = { selectedItemForDetail = null },
-                      onPlay = {
-                          selectedItemForDetail = null
-                          onMediaSelected(item)
-                      },
-                      onToggleWatched = { repository.toggleWatched(item.id) }
-                  )
-              }
-          }
-          EOF
-
-          cat << 'EOF' > app/src/main/java/com/infuse/player/ui/player/PlayerScreen.kt
-          package com.infuse.player.ui.player
-
-          import android.app.Activity
-          import android.content.Context
-          import android.media.AudioManager
-          import android.view.ViewGroup
-          import android.widget.FrameLayout
-          import androidx.annotation.OptIn
-          import androidx.compose.animation.AnimatedVisibility
-          import androidx.compose.animation.fadeIn
-          import androidx.compose.animation.fadeOut
-          import androidx.compose.foundation.background
-          import androidx.compose.foundation.gestures.detectDragGestures
-          import androidx.compose.foundation.gestures.detectTapGestures
-          import androidx.compose.foundation.layout.*
-          import androidx.compose.foundation.shape.CircleShape
-          import androidx.compose.foundation.shape.RoundedCornerShape
-          import androidx.compose.material.icons.Icons
-          import androidx.compose.material.icons.filled.*
-          import androidx.compose.material3.*
-          import androidx.compose.runtime.*
-          import androidx.compose.ui.Alignment
-          import androidx.compose.ui.Modifier
-          import androidx.compose.ui.graphics.Brush
-          import androidx.compose.ui.graphics.Color
-          import androidx.compose.ui.input.pointer.pointerInput
-          import androidx.compose.ui.platform.LocalContext
-          import androidx.compose.ui.text.font.FontWeight
-          import androidx.compose.ui.unit.dp
-          import androidx.compose.ui.unit.sp
-          import androidx.compose.ui.viewinterop.AndroidView
-          import androidx.media3.common.C
-          import androidx.media3.common.MediaItem as ExoMediaItem
-          import androidx.media3.common.Player
-          import androidx.media3.common.Tracks
-          import androidx.media3.common.util.UnstableApi
-          import androidx.media3.exoplayer.DefaultRenderersFactory
-          import androidx.media3.exoplayer.ExoPlayer
-          import androidx.media3.ui.AspectRatioFrameLayout
-          import androidx.media3.ui.PlayerView
-          import com.infuse.player.data.model.MediaItem
-          import kotlinx.coroutines.delay
-
-          @OptIn(UnstableApi::class)
-          @Composable
-          fun PlayerScreen(
-              media: MediaItem,
-              onBack: () -> Unit
-          ) {
-              val context = LocalContext.current
-              val activity = context as? Activity
-              val audioManager = remember { context.getSystemService(Context.AUDIO_SERVICE) as AudioManager }
-
-              var brightness by remember {
-                  val cur = activity?.window?.attributes?.screenBrightness ?: 0.75f
-                  mutableFloatStateOf(if (cur < 0) 0.75f else cur)
-              }
-              val maxVolume = remember { audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1) }
-              var currentVolume by remember {
-                  mutableFloatStateOf(audioManager.getStreamVolume(AudioManager.STREAM_MUSIC).toFloat() / maxVolume)
-              }
-
-              var showBrightnessHud by remember { mutableStateOf(false) }
-              var showVolumeHud by remember { mutableStateOf(false) }
-              var showControls by remember { mutableStateOf(true) }
-              var showInfoDialog by remember { mutableStateOf(false) }
-              var isPlaying by remember { mutableStateOf(true) }
-              var currentPosition by remember { mutableLongStateOf(0L) }
-              var totalDuration by remember { mutableLongStateOf((media.durationSeconds * 1000).coerceAtLeast(1L)) }
-              var detectedVideoTrackInfo by remember { mutableStateOf(media.resolution) }
-              var detectedAudioTrackInfo by remember { mutableStateOf(media.audioSpec) }
-              var resizeMode by remember { mutableIntStateOf(AspectRatioFrameLayout.RESIZE_MODE_FIT) }
-
-              val exoPlayer = remember {
-                  val renderersFactory = DefaultRenderersFactory(context)
-                      .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
-                      .setEnableDecoderFallback(true)
-
-                  ExoPlayer.Builder(context, renderersFactory).build().apply {
-                      setMediaItem(ExoMediaItem.fromUri(media.streamUri))
-                      prepare()
-                      playWhenReady = true
-                      addListener(object : Player.Listener {
-                          override fun onIsPlayingChanged(playing: Boolean) {
-                              isPlaying = playing
-                          }
-                          override fun onPlaybackStateChanged(state: Int) {
-                              if (state == Player.STATE_READY && duration > 0) {
-                                  totalDuration = duration
-                              }
-                          }
-                          override fun onTracksChanged(tracks: Tracks) {
-                              for (group in tracks.groups) {
-                                  if (group.type == C.TRACK_TYPE_VIDEO && group.length > 0) {
-                                      val fmt = group.getTrackFormat(0)
-                                      detectedVideoTrackInfo = "${fmt.width}x${fmt.height} • ${fmt.sampleMimeType ?: "Hardware Video"} • ${fmt.frameRate.toInt()} fps"
-                                  }
-                                  if (group.type == C.TRACK_TYPE_AUDIO && group.length > 0) {
-                                      val fmt = group.getTrackFormat(0)
-                                      detectedAudioTrackInfo = "${fmt.sampleMimeType ?: "Audio"} • ${fmt.channelCount} ch • ${fmt.sampleRate} Hz"
-                                  }
-                              }
-                          }
-                      })
-                  }
-              }
-
-              LaunchedEffect(showControls, isPlaying) {
-                  if (showControls && isPlaying) {
-                      delay(4000)
-                      showControls = false
-                  }
-              }
-
-              LaunchedEffect(exoPlayer) {
-                  while (true) {
-                      currentPosition = exoPlayer.currentPosition
-                      delay(500)
-                  }
-              }
-
-              DisposableEffect(Unit) {
-                  onDispose { exoPlayer.release() }
-              }
-
-              Box(
-                  modifier = Modifier
-                      .fillMaxSize()
-                      .background(Color.Black)
-                      .pointerInput(Unit) {
-                          detectTapGestures(
-                              onTap = { showControls = !showControls },
-                              onDoubleTap = { offset ->
-                                  val isLeft = offset.x < size.width / 2
-                                  val delta = if (isLeft) -10_000L else 10_000L
-                                  exoPlayer.seekTo((exoPlayer.currentPosition + delta).coerceAtLeast(0L))
-                              }
-                          )
-                      }
-                      .pointerInput(Unit) {
-                          detectDragGestures(
-                              onDragEnd = {
-                                  showBrightnessHud = false
-                                  showVolumeHud = false
-                              },
-                              onDragCancel = {
-                                  showBrightnessHud = false
-                                  showVolumeHud = false
-                              },
-                              onDrag = { change, dragAmount ->
-                                  change.consume()
-                                  val isLeft = change.position.x < size.width / 2
-                                  val delta = -dragAmount.y / 400f
-                                  if (isLeft) {
-                                      showBrightnessHud = true
-                                      brightness = (brightness + delta).coerceIn(0.05f, 1f)
-                                      activity?.window?.let { win ->
-                                          val lp = win.attributes
-                                          lp.screenBrightness = brightness
-                                          win.attributes = lp
-                                      }
-                                  } else {
-                                      showVolumeHud = true
-                                      currentVolume = (currentVolume + delta).coerceIn(0f, 1f)
-                                      audioManager.setStreamVolume(
-                                          AudioManager.STREAM_MUSIC,
-                                          (currentVolume * maxVolume).toInt(),
-                                          0
-                                      )
-                                  }
-                              }
-                          )
-                      }
-              ) {
-                  AndroidView(
-                      factory = { ctx ->
-                          PlayerView(ctx).apply {
-                              player = exoPlayer
-                              useController = false
-                              layoutParams = FrameLayout.LayoutParams(
-                                  ViewGroup.LayoutParams.MATCH_PARENT,
-                                  ViewGroup.LayoutParams.MATCH_PARENT
-                              )
-                          }
-                      },
-                      update = { view ->
-                          view.resizeMode = resizeMode
-                      },
-                      modifier = Modifier.fillMaxSize()
-                  )
-
-                  AnimatedVisibility(
-                      visible = showBrightnessHud,
-                      enter = fadeIn(),
-                      exit = fadeOut(),
-                      modifier = Modifier.align(Alignment.CenterStart).padding(start = 24.dp)
-                  ) {
-                      HudBar(Icons.Default.BrightnessMedium, brightness, "${(brightness * 100).toInt()}%", Color(0xFFF59E0B))
-                  }
-
-                  AnimatedVisibility(
-                      visible = showVolumeHud,
-                      enter = fadeIn(),
-                      exit = fadeOut(),
-                      modifier = Modifier.align(Alignment.CenterEnd).padding(end = 24.dp)
-                  ) {
-                      HudBar(Icons.Default.VolumeUp, currentVolume, "${(currentVolume * 100).toInt()}%", Color(0xFF38BDF8))
-                  }
-
-                  AnimatedVisibility(
-                      visible = showControls,
-                      enter = fadeIn(),
-                      exit = fadeOut(),
-                      modifier = Modifier.fillMaxSize()
-                  ) {
-                      Column(
-                          modifier = Modifier
-                              .fillMaxSize()
-                              .background(
-                                  Brush.verticalGradient(
-                                      listOf(Color.Black.copy(alpha = 0.75f), Color.Transparent, Color.Black.copy(alpha = 0.85f))
-                                  )
-                              )
-                              .padding(20.dp),
-                          verticalArrangement = Arrangement.SpaceBetween
-                      ) {
-                          Row(
-                              modifier = Modifier.fillMaxWidth(),
-                              horizontalArrangement = Arrangement.SpaceBetween,
-                              verticalAlignment = Alignment.CenterVertically
-                          ) {
-                              IconButton(onClick = onBack) {
-                                  Icon(Icons.Default.ArrowBack, contentDescription = "Back", tint = Color.White)
-                              }
-                              Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                  Text(media.title, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp, maxLines = 1)
-                                  Text(detectedVideoTrackInfo, color = Color(0xFFF97316), fontSize = 11.sp)
-                              }
-                              Row {
-                                  IconButton(onClick = {
-                                      resizeMode = if (resizeMode == AspectRatioFrameLayout.RESIZE_MODE_FIT) {
-                                          AspectRatioFrameLayout.RESIZE_MODE_ZOOM
-                                      } else {
-                                          AspectRatioFrameLayout.RESIZE_MODE_FIT
-                                      }
-                                  }) {
-                                      Icon(Icons.Default.AspectRatio, contentDescription = "Zoom/Fit", tint = Color.White)
-                                  }
-                                  IconButton(onClick = { showInfoDialog = true }) {
-                                      Icon(Icons.Default.Info, contentDescription = "Stream Info", tint = Color.White)
-                                  }
-                              }
-                          }
-
-                          Row(
-                              modifier = Modifier.fillMaxWidth(),
-                              horizontalArrangement = Arrangement.SpaceEvenly,
-                              verticalAlignment = Alignment.CenterVertically
-                          ) {
-                              IconButton(onClick = { exoPlayer.seekTo((exoPlayer.currentPosition - 10_000L).coerceAtLeast(0L)) }) {
-                                  Icon(Icons.Default.Replay10, contentDescription = "-10s", tint = Color.White, modifier = Modifier.size(36.dp))
-                              }
-                              IconButton(
-                                  onClick = { if (exoPlayer.isPlaying) exoPlayer.pause() else exoPlayer.play() },
-                                  modifier = Modifier.size(72.dp).background(Color(0xFFF97316), CircleShape)
-                              ) {
-                                  Icon(
-                                      if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
-                                      contentDescription = "Play/Pause",
-                                      tint = Color.White,
-                                      modifier = Modifier.size(36.dp)
-                                  )
-                              }
-                              IconButton(onClick = { exoPlayer.seekTo(exoPlayer.currentPosition + 10_000L) }) {
-                                  Icon(Icons.Default.Forward10, contentDescription = "+10s", tint = Color.White, modifier = Modifier.size(36.dp))
-                              }
-                          }
-
-                          Column(modifier = Modifier.fillMaxWidth()) {
-                              Slider(
-                                  value = if (totalDuration > 0) (currentPosition.toFloat() / totalDuration).coerceIn(0f, 1f) else 0f,
-                                  onValueChange = { frac -> exoPlayer.seekTo((frac * totalDuration).toLong()) },
-                                  colors = SliderDefaults.colors(thumbColor = Color.White, activeTrackColor = Color(0xFFF97316))
-                              )
-                              Row(
-                                  modifier = Modifier.fillMaxWidth(),
-                                  horizontalArrangement = Arrangement.SpaceBetween
-                              ) {
-                                  Text(formatMs(currentPosition), color = Color.LightGray, fontSize = 12.sp)
-                                  Text(detectedAudioTrackInfo, color = Color.Gray, fontSize = 11.sp)
-                                  Text(formatMs(totalDuration), color = Color.LightGray, fontSize = 12.sp)
-                              }
-                          }
-                      }
-                  }
-
-                  if (showInfoDialog) {
-                      AlertDialog(
-                          onDismissRequest = { showInfoDialog = false },
-                          containerColor = Color(0xFF151821),
-                          title = { Text("Live Stream & File Metadata", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp) },
-                          text = {
-                              Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                                  Text("Title: ${media.title} (${media.year})", color = Color.LightGray, fontSize = 13.sp)
-                                  Text("File: ${media.rawFilename}", color = Color.LightGray, fontSize = 12.sp)
-                                  Text("Video Stream: $detectedVideoTrackInfo", color = Color(0xFFF97316), fontSize = 12.sp)
-                                  Text("Audio Stream: $detectedAudioTrackInfo", color = Color(0xFF38BDF8), fontSize = 12.sp)
-                                  Text("Bitrate: ${media.bitrate} • Size: ${media.fileSize}", color = Color.LightGray, fontSize = 12.sp)
-                                  Text("Synopsis: ${media.synopsis}", color = Color.Gray, fontSize = 12.sp)
-                              }
-                          },
-                          confirmButton = {
-                              TextButton(onClick = { showInfoDialog = false }) {
-                                  Text("Close", color = Color(0xFFF97316))
-                              }
-                          }
-                      )
-                  }
-              }
-          }
-
-          @Composable
-          fun HudBar(
-              icon: androidx.compose.ui.graphics.vector.ImageVector,
-              value: Float,
-              label: String,
-              color: Color
-          ) {
-              Card(
-                  shape = RoundedCornerShape(16.dp),
-                  colors = CardDefaults.cardColors(containerColor = Color.Black.copy(alpha = 0.8f))
-              ) {
-                  Column(
-                      modifier = Modifier.padding(12.dp),
-                      horizontalAlignment = Alignment.CenterHorizontally,
-                      verticalArrangement = Arrangement.spacedBy(8.dp)
-                  ) {
-                      Icon(icon, contentDescription = null, tint = color, modifier = Modifier.size(20.dp))
-                      Box(
-                          modifier = Modifier.width(6.dp).height(110.dp).background(Color.White.copy(alpha = 0.2f), RoundedCornerShape(3.dp)),
-                          contentAlignment = Alignment.BottomCenter
-                      ) {
-                          Box(modifier = Modifier.fillMaxWidth().fillMaxHeight(value).background(color, RoundedCornerShape(3.dp)))
-                      }
-                      Text(label, color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold)
-                  }
-              }
-          }
-
-          fun formatMs(ms: Long): String {
-              val totalSeconds = (ms / 1000).coerceAtLeast(0)
-              val h = totalSeconds / 3600
-              val m = (totalSeconds % 3600) / 60
-              val s = totalSeconds % 60
-              return if (h > 0) String.format("%02d:%02d:%02d", h, m, s) else String.format("%02d:%02d", m, s)
-          }
-          EOF
-
-          cat << 'EOF' > app/src/main/java/com/infuse/player/MainActivity.kt
-          package com.infuse.player
-
-          import android.Manifest
-          import android.content.Intent
-          import android.os.Build
-          import android.os.Bundle
-          import androidx.activity.ComponentActivity
-          import androidx.activity.compose.rememberLauncherForActivityResult
-          import androidx.activity.compose.setContent
-          import androidx.activity.result.contract.ActivityResultContracts
-          import androidx.compose.runtime.*
-          import com.infuse.player.data.model.MediaItem
-          import com.infuse.player.data.repository.MediaRepository
-          import com.infuse.player.ui.library.LibraryScreen
-          import com.infuse.player.ui.player.PlayerScreen
-          import com.infuse.player.ui.theme.InfuseTheme
-
-          class MainActivity : ComponentActivity() {
-
-              private lateinit var repository: MediaRepository
-
-              override fun onCreate(savedInstanceState: Bundle?) {
-                  super.onCreate(savedInstanceState)
-                  repository = MediaRepository(applicationContext)
-
-                  setContent {
-                      InfuseTheme {
-                          var activePlayingMedia by remember { mutableStateOf<MediaItem?>(null) }
-
-                          // Handle external video intent if user opened a video from Gallery/Files
-                          LaunchedEffect(Unit) {
-                              intent?.data?.let { externalUri ->
-                                  repository.addPickedVideoUri(externalUri) { item ->
-                                      activePlayingMedia = item
-                                  }
-                              }
-                          }
-
-                          // Permission launcher to auto-scan all local videos on device
-                          val permissionLauncher = rememberLauncherForActivityResult(
-                              ActivityResultContracts.RequestMultiplePermissions()
-                          ) {
-                              repository.scanDeviceVideos()
-                          }
-
-                          // File picker launcher to open any local video format (MKV, MP4, AVI, WebM, TS, MOV)
-                          val filePickerLauncher = rememberLauncherForActivityResult(
-                              ActivityResultContracts.OpenDocument()
-                          ) { uri ->
-                              uri?.let {
-                                  try {
-                                      contentResolver.takePersistableUriPermission(
-                                          it,
-                                          Intent.FLAG_GRANT_READ_URI_PERMISSION
-                                      )
-                                  } catch (_: Exception) {}
-                                  repository.addPickedVideoUri(it) { item ->
-                                      activePlayingMedia = item
-                                  }
-                              }
-                          }
-
-                          LaunchedEffect(Unit) {
-                              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                                  permissionLauncher.launch(arrayOf(Manifest.permission.READ_MEDIA_VIDEO))
-                              } else {
-                                  permissionLauncher.launch(arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE))
-                              }
-                          }
-
-                          if (activePlayingMedia != null) {
-                              PlayerScreen(
-                                  media = activePlayingMedia!!,
-                                  onBack = { activePlayingMedia = null }
-                              )
-                          } else {
-                              LibraryScreen(
-                                  repository = repository,
-                                  onMediaSelected = { media -> activePlayingMedia = media },
-                                  onPickLocalFile = { filePickerLauncher.launch(arrayOf("video/*", "application/octet-stream")) },
-                                  onRescanStorage = { repository.scanDeviceVideos() }
-                              )
-                          }
-                      }
-                  }
-              }
-          }
-          EOF
-
-          cat << 'EOF' > gradle.properties
-          android.useAndroidX=true
-          android.nonTransitiveRClass=true
-          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
-          EOF
-
-          cat << 'EOF' > settings.gradle.kts
-          pluginManagement {
-              repositories {
-                  google()
-                  mavenCentral()
-                  gradlePluginPortal()
-              }
-          }
-          dependencyResolutionManagement {
-              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
-              repositories {
-                  google()
-                  mavenCentral()
-              }
-          }
-          rootProject.name = "InfuseAndroid"
-          include(":app")
-          EOF
-
-          cat << 'EOF' > build.gradle.kts
-          plugins {
-              id("com.android.application") version "8.5.2" apply false
-              id("org.jetbrains.kotlin.android") version "2.0.0" apply false
-              id("org.jetbrains.kotlin.plugin.compose") version "2.0.0" apply false
-          }
-          EOF
-
-          cat << 'EOF' > app/build.gradle.kts
-          plugins {
-              id("com.android.application")
-              id("org.jetbrains.kotlin.android")
-              id("org.jetbrains.kotlin.plugin.compose")
-          }
-
-          android {
-              namespace = "com.infuse.player"
-              compileSdk = 35
-
-              defaultConfig {
-                  applicationId = "com.infuse.player"
-                  minSdk = 26
-                  targetSdk = 35
-                  versionCode = 2
-                  versionName = "2.0.0"
-              }
-
-              compileOptions {
-                  sourceCompatibility = JavaVersion.VERSION_17
-                  targetCompatibility = JavaVersion.VERSION_17
-              }
-              kotlinOptions {
-                  jvmTarget = "17"
-              }
-              buildFeatures {
-                  compose = true
-              }
-              packaging {
-                  resources {
-                      excludes += "/META-INF/{AL2.0,LGPL2.1}"
-                  }
-              }
-          }
-
-          dependencies {
-              implementation("androidx.core:core-ktx:1.13.1")
-              implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.6")
-              implementation("androidx.activity:activity-compose:1.9.3")
-              implementation(platform("androidx.compose:compose-bom:2024.10.00"))
-              implementation("androidx.compose.ui:ui")
-              implementation("androidx.compose.ui:ui-graphics")
-              implementation("androidx.compose.material3:material3")
-              implementation("androidx.compose.material:material-icons-extended")
-              implementation("androidx.media3:media3-exoplayer:1.4.1")
-              implementation("androidx.media3:media3-exoplayer-dash:1.4.1")
-              implementation("androidx.media3:media3-exoplayer-hls:1.4.1")
-              implementation("androidx.media3:media3-ui:1.4.1")
-              implementation("androidx.media3:media3-common:1.4.1")
-              implementation("androidx.media3:media3-extractor:1.4.1")
-              implementation("io.coil-kt:coil-compose:2.7.0")
-              implementation("com.hierynomus:smbj:0.13.0")
-              implementation("com.squareup.okhttp3:okhttp:4.12.0")
-          }
-          EOF
-
-      - name: Build Debug APK
-        run: gradle :app:assembleDebug --stacktrace
-
-      - name: Upload Debug APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: Infuse-Android-Player-Debug
-          path: app/build/outputs/apk/debug/*.apk
-          retention-days: 14
+                      fileSize = sizeText,
+                      subtitleSummary = if (subTracksFound.isNotEmpty()) subTracksFound.joinToString(", ") else "Supports External .SRT / .ASS / .VTT",
+                      streamUri = uri.toString(),
+                      posterUrl = 

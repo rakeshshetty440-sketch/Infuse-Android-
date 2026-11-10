@@ -260,7 +260,7 @@ class TmdbScraperService(
                             val backdropPath = obj.optString("backdrop_path", "")
                             val overview = obj.optString("overview", "")
                             val vote = obj.optDouble("vote_average", 8.0)
-                            val date = if (isTv) obj.optString("first_air_date") else obj.optString("release_date")
+                            val date = if (isTv) obj.optString("first_air_date") else firstAirOrRelease(obj)
                             val yr = date.take(4).toIntOrNull() ?: year ?: 2026
 
                             list.add(
@@ -282,6 +282,8 @@ class TmdbScraperService(
         } catch (_: Exception) {}
         list
     }
+
+    private fun firstAirOrRelease(obj: JSONObject): String = obj.optString("release_date", "")
 }
 EOF
 
@@ -314,7 +316,7 @@ import java.util.Locale
 class MediaRepository(private val context: Context) {
     val scraper = TmdbScraperService()
     private val scope = CoroutineScope(Dispatchers.IO)
-    private val prefs = context.getSharedPreferences("infuse_v5_store", Context.MODE_PRIVATE)
+    private val prefs = context.getSharedPreferences("infuse_v6_store", Context.MODE_PRIVATE)
 
     private val _mediaList = MutableStateFlow<List<MediaItem>>(emptyList())
     val mediaList: StateFlow<List<MediaItem>> = _mediaList.asStateFlow()
@@ -322,7 +324,6 @@ class MediaRepository(private val context: Context) {
     private val _isScanning = MutableStateFlow(false)
     val isScanning: StateFlow<Boolean> = _isScanning.asStateFlow()
 
-    // Normalize resume key by filename so MediaStore URI and DocumentPicker URI share the exact same resume state!
     private fun resumeKey(rawFilename: String, streamUri: String): String {
         val cleanKey = rawFilename.trim().lowercase(Locale.ROOT)
         return if (cleanKey.isNotEmpty()) "pos_file_$cleanKey" else "pos_uri_$streamUri"
@@ -333,7 +334,6 @@ class MediaRepository(private val context: Context) {
         return if (cleanKey.isNotEmpty()) "watched_file_$cleanKey" else "watched_uri_$streamUri"
     }
 
-    // Use synchronous commit() so closing or swiping away the app NEVER loses the timestamp!
     fun savePlaybackPosition(item: MediaItem, positionMs: Long, durationMs: Long) {
         if (positionMs <= 1000L) return
         val rKey = resumeKey(item.rawFilename, item.streamUri)
@@ -347,7 +347,7 @@ class MediaRepository(private val context: Context) {
         if (watched) {
             editor.putBoolean(wKey, true)
         }
-        editor.commit() // Synchronous write to disk
+        editor.commit()
 
         _mediaList.value = _mediaList.value.map { current ->
             if (current.id == item.id || current.rawFilename.equals(item.rawFilename, ignoreCase = true) || current.streamUri == item.streamUri) {
@@ -366,7 +366,7 @@ class MediaRepository(private val context: Context) {
 
     private fun savePickedUriToHistory(uri: String, name: String, sizeBytes: Long) {
         try {
-            val rawJson = prefs.getString("picked_history_v5", "[]") ?: "[]"
+            val rawJson = prefs.getString("picked_history_v6", "[]") ?: "[]"
             val arr = JSONArray(rawJson)
             val updated = JSONArray()
             val entry = JSONObject().apply {
@@ -381,14 +381,14 @@ class MediaRepository(private val context: Context) {
                     updated.put(obj)
                 }
             }
-            prefs.edit().putString("picked_history_v5", updated.toString()).commit()
+            prefs.edit().putString("picked_history_v6", updated.toString()).commit()
         } catch (_: Exception) {}
     }
 
     private fun loadPickedHistory(): List<MediaItem> {
         val list = mutableListOf<MediaItem>()
         try {
-            val rawJson = prefs.getString("picked_history_v5", "[]") ?: "[]"
+            val rawJson = prefs.getString("picked_history_v6", "[]") ?: "[]"
             val arr = JSONArray(rawJson)
             for (i in 0 until arr.length()) {
                 val obj = arr.getJSONObject(i)
@@ -415,20 +415,17 @@ class MediaRepository(private val context: Context) {
         return list
     }
 
-    // Instant <0.2s Device Scan: Queries MediaStore columns ONLY (never blocks on heavy file I/O)
     fun scanDeviceVideos() {
         scope.launch {
             _isScanning.value = true
             val discovered = mutableListOf<MediaItem>()
             val seenNames = mutableSetOf<String>()
 
-            // 1. Restore any manually opened videos first so they are always remembered
             for (picked in loadPickedHistory()) {
                 discovered.add(picked)
                 seenNames.add(picked.rawFilename.lowercase(Locale.ROOT))
             }
 
-            // 2. Fast MediaStore cursor query
             val projection = arrayOf(
                 MediaStore.Video.Media._ID,
                 MediaStore.Video.Media.DISPLAY_NAME,
@@ -492,11 +489,9 @@ class MediaRepository(private val context: Context) {
                 discovered.addAll(defaultDemoSamples())
             }
 
-            // Immediately publish the list so the UI is NEVER stuck at 0!
             _mediaList.value = discovered
             _isScanning.value = false
 
-            // 3. Enrich posters/metadata asynchronously in the background
             val working = discovered.toMutableList()
             for (i in working.indices) {
                 val item = working[i]
@@ -518,7 +513,6 @@ class MediaRepository(private val context: Context) {
         }
     }
 
-    // On-Demand Deep Track Inspector: Runs ONLY for the single clicked video (<80ms)
     suspend fun inspectSingleVideoDeepSpecs(item: MediaItem): MediaItem = withContext(Dispatchers.IO) {
         if (item.hasDeepSpecs) return@withContext item
 
@@ -868,6 +862,31 @@ class MediaRepository(private val context: Context) {
             posterUrl = "https://images.unsplash.com/photo-1451187580459-43490279c0fa?w=600&q=80",
             backdropUrl = "https://images.unsplash.com/photo-1506703719100-a0f3a48c0f86?w=1200&q=80",
             synopsis = "Instant scanner & persistent resume active! Tap Open Video or grant permission to browse and play all local videos with Next/Previous skipping."
+        ),
+        MediaItem(
+            id = "demo_2",
+            title = "Elephants Dream",
+            rawFilename = "Elephants.Dream.2006.1080p.WebRip.x264.mp4",
+            folderName = "Sample Stream",
+            year = 2006,
+            durationText = "10m 53s",
+            durationSeconds = 653,
+            rating = "7.9",
+            qualityTag = "1080p FHD",
+            resolution = "1920x1080",
+            frameRate = "24 fps",
+            hdrFormat = "SDR (8-bit)",
+            audioSpec = "AAC Stereo",
+            audioDetails = "48.0 kHz • 2 Channels • ENG",
+            videoCodec = "AVC / H.264",
+            container = "MPEG-4 (MP4)",
+            bitrate = "4.8 Mbps",
+            fileSize = "142 MB",
+            subtitleSummary = "Embedded + External .SRT/.ASS",
+            streamUri = "https://storage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4",
+            posterUrl = "https://images.unsplash.com/photo-1518709268805-4e9042af9f23?w=600&q=80",
+            backdropUrl = "https://images.unsplash.com/photo-1518709268805-4e9042af9f23?w=1200&q=80",
+            synopsis = "Second sample video ready for instant Next/Previous video skipping and landscape/portrait rotation testing."
         )
     )
 }
@@ -944,7 +963,6 @@ fun MediaDetailSheet(
     var searchResults by remember { mutableStateOf<List<TmdbSearchCandidate>>(emptyList()) }
     var isSearching by remember { mutableStateOf(false) }
 
-    // Inspect exact video/audio/subtitle tracks on-demand in <80ms when sheet opens
     LaunchedEffect(media.id) {
         val latestSavedPos = repository.getSavedPosition(media)
         currentMedia = media.copy(savedPositionMs = latestSavedPos)
@@ -1310,7 +1328,7 @@ fun LibraryScreen(
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Text("Infuse", fontWeight = FontWeight.ExtraBold, color = Color.White, fontSize = 20.sp)
                             Badge(containerColor = Color(0x33F97316), contentColor = Color(0xFFF97316)) {
-                                Text("PRO v5.0", fontSize = 9.sp, fontWeight = FontWeight.Black)
+                                Text("PRO v6.0", fontSize = 9.sp, fontWeight = FontWeight.Black)
                             }
                         }
                     },
@@ -1625,9 +1643,9 @@ data class VlcTrackOption(
 @Composable
 fun PlayerScreen(
     media: MediaItem,
+    playlist: List<MediaItem>,
     initialSeekMs: Long,
-    hasPrevious: Boolean,
-    hasNext: Boolean,
+    onSelectVideoFromPlaylist: (MediaItem) -> Unit,
     onSkipPrevious: () -> Unit,
     onSkipNext: () -> Unit,
     repository: MediaRepository,
@@ -1650,6 +1668,7 @@ fun PlayerScreen(
 
     var showAudioDialog by remember { mutableStateOf(false) }
     var showSubtitleDialog by remember { mutableStateOf(false) }
+    var showPlaylistDialog by remember { mutableStateOf(false) }
     var showInfoDialog by remember { mutableStateOf(false) }
 
     var brightness by remember {
@@ -1663,7 +1682,9 @@ fun PlayerScreen(
 
     var isPlaying by remember(media.id) { mutableStateOf(true) }
     var currentPosition by remember(media.id) { mutableLongStateOf(initialSeekMs) }
-    var totalDuration by remember(media.id) { mutableLongStateOf((media.durationSeconds * 1000).coerceAtLeast(1L)) }
+    var totalDuration by remember(media.id) { mutableLongStateOf((media.durationSeconds * 1000L).coerceAtLeast(60_000L)) }
+    var isUserScrubbing by remember { mutableStateOf(false) }
+    var scrubFraction by remember { mutableFloatStateOf(0f) }
     var playbackSpeed by remember { mutableFloatStateOf(1.0f) }
 
     var audioTracks by remember(media.id) { mutableStateOf<List<VlcTrackOption>>(emptyList()) }
@@ -1678,7 +1699,17 @@ fun PlayerScreen(
         MediaPlayer.ScaleType.SURFACE_FIT_SCREEN
     )
 
-    // Fullscreen Landscape Mode
+    // Helper to toggle screen orientation cleanly
+    fun toggleScreenRotation() {
+        isLandscape = !isLandscape
+        activity?.requestedOrientation = if (isLandscape) {
+            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        } else {
+            ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+        }
+    }
+
+    // Enter Fullscreen Immersive Landscape on launch
     DisposableEffect(activity) {
         val window = activity?.window
         val originalOrientation = activity?.requestedOrientation ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
@@ -1691,7 +1722,7 @@ fun PlayerScreen(
         }
 
         onDispose {
-            activity?.requestedOrientation = originalOrientation
+            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
             if (window != null) {
                 val controller = WindowCompat.getInsetsController(window, window.decorView)
                 controller.show(WindowInsetsCompat.Type.systemBars())
@@ -1717,6 +1748,35 @@ fun PlayerScreen(
         }
     }
 
+    // Dual-Method Universal Seek: Works on ALL MKV, MP4, AVI, TS, WebM files (even when getLength() is 0 or unindexed!)
+    fun seekUniversalToMs(targetMs: Long) {
+        val len = vlcPlayer.length
+        val effDur = if (len > 0) len else totalDuration
+        val clampedMs = if (effDur > 0) targetMs.coerceIn(0L, effDur) else targetMs.coerceAtLeast(0L)
+
+        vlcPlayer.time = clampedMs
+        if (effDur > 0) {
+            val targetPos = (clampedMs.toFloat() / effDur.toFloat()).coerceIn(0f, 0.999f)
+            vlcPlayer.position = targetPos
+        }
+        currentPosition = clampedMs
+    }
+
+    fun seekRelativeMs(deltaMs: Long) {
+        val len = vlcPlayer.length
+        val effDur = if (len > 0) len else totalDuration
+        if (effDur > 0) {
+            val baseTime = if (vlcPlayer.time > 0) vlcPlayer.time else currentPosition
+            seekUniversalToMs(baseTime + deltaMs)
+        } else {
+            // Fallback percentage jump when container has no duration header
+            val curPos = vlcPlayer.position.coerceIn(0f, 1f)
+            val deltaPos = if (deltaMs > 0) 0.02f else -0.02f
+            val nextPos = (curPos + deltaPos).coerceIn(0f, 0.999f)
+            vlcPlayer.position = nextPos
+        }
+    }
+
     fun refreshVlcTracks() {
         val curAudio = vlcPlayer.audioTrack
         val aList = vlcPlayer.audioTracks?.map { desc ->
@@ -1731,13 +1791,16 @@ fun PlayerScreen(
         subtitleTracks = sList
     }
 
-    // Load or switch video whenever media.streamUri changes (supports Next / Previous skipping!)
+    // Open video using real file path first (if available) so LibVLC has 100% native random-access seeking!
     DisposableEffect(media.streamUri, initialSeekMs) {
         var pfd: ParcelFileDescriptor? = null
         val uri = Uri.parse(media.streamUri)
 
         val vlcMedia = try {
-            if (uri.scheme == "content") {
+            val directFile = if (media.filePath.isNotEmpty()) File(media.filePath) else null
+            if (directFile != null && directFile.exists() && directFile.canRead()) {
+                Media(libVlc, directFile.absolutePath)
+            } else if (uri.scheme == "content") {
                 pfd = context.contentResolver.openFileDescriptor(uri, "r")
                 if (pfd != null) {
                     Media(libVlc, pfd!!.fileDescriptor)
@@ -1752,7 +1815,6 @@ fun PlayerScreen(
         }
 
         vlcMedia.setHWDecoderEnabled(true, false)
-        // Tell LibVLC directly to start at the exact resume second!
         if (initialSeekMs > 1000L) {
             vlcMedia.addOption(":start-time=${initialSeekMs / 1000L}")
         }
@@ -1767,9 +1829,7 @@ fun PlayerScreen(
                     if (vlcPlayer.length > 0) totalDuration = vlcPlayer.length
                     if (!didSeekAfterPlay && initialSeekMs > 1000L) {
                         didSeekAfterPlay = true
-                        if (vlcPlayer.time < initialSeekMs - 2000L) {
-                            vlcPlayer.time = initialSeekMs
-                        }
+                        seekUniversalToMs(initialSeekMs)
                     }
                     refreshVlcTracks()
                 }
@@ -1777,7 +1837,14 @@ fun PlayerScreen(
                     isPlaying = false
                 }
                 MediaPlayer.Event.TimeChanged -> {
-                    currentPosition = event.timeChanged
+                    if (!isUserScrubbing && event.timeChanged > 0) {
+                        currentPosition = event.timeChanged
+                    }
+                }
+                MediaPlayer.Event.PositionChanged -> {
+                    if (!isUserScrubbing && totalDuration > 0 && vlcPlayer.time <= 0L) {
+                        currentPosition = (event.positionChanged * totalDuration).toLong()
+                    }
                 }
                 MediaPlayer.Event.LengthChanged -> {
                     if (event.lengthChanged > 0) totalDuration = event.lengthChanged
@@ -1806,7 +1873,6 @@ fun PlayerScreen(
         }
     }
 
-    // Synchronously commit resume timestamp when user presses Home, switches apps, or closes app
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_PAUSE || event == Lifecycle.Event.ON_STOP) {
@@ -1834,14 +1900,13 @@ fun PlayerScreen(
         }
     }
 
-    LaunchedEffect(showControls, isPlaying) {
-        if (showControls && isPlaying) {
-            delay(4000)
+    LaunchedEffect(showControls, isPlaying, isUserScrubbing) {
+        if (showControls && isPlaying && !isUserScrubbing) {
+            delay(4500)
             showControls = false
         }
     }
 
-    // Save resume position every 2 seconds while playing
     LaunchedEffect(media.id) {
         while (true) {
             if (isPlaying && currentPosition > 1000L) {
@@ -1863,10 +1928,7 @@ fun PlayerScreen(
                     onDoubleTap = { offset ->
                         if (!isControlsLocked) {
                             val isLeft = offset.x < size.width / 2
-                            val delta = if (isLeft) -10_000L else 10_000L
-                            val nextTime = (currentPosition + delta).coerceIn(0L, totalDuration)
-                            vlcPlayer.time = nextTime
-                            currentPosition = nextTime
+                            seekRelativeMs(if (isLeft) -10_000L else 10_000L)
                         }
                     }
                 )
@@ -1922,11 +1984,9 @@ fun PlayerScreen(
                                 }
                                 "seek" -> {
                                     showSeekHud = true
-                                    val seekDelta = (dragAmount.x * 150L).toLong()
-                                    val target = (currentPosition + seekDelta).coerceIn(0L, totalDuration)
-                                    vlcPlayer.time = target
-                                    currentPosition = target
-                                    seekPreviewText = formatMs(target)
+                                    val seekDelta = (dragAmount.x * 180L).toLong()
+                                    seekRelativeMs(seekDelta)
+                                    seekPreviewText = formatMs(currentPosition)
                                 }
                             }
                         }
@@ -2012,13 +2072,13 @@ fun PlayerScreen(
                         .fillMaxSize()
                         .background(
                             Brush.verticalGradient(
-                                listOf(Color.Black.copy(alpha = 0.82f), Color.Transparent, Color.Black.copy(alpha = 0.88f))
+                                listOf(Color.Black.copy(alpha = 0.85f), Color.Transparent, Color.Black.copy(alpha = 0.90f))
                             )
                         )
-                        .padding(horizontal = 20.dp, vertical = 16.dp),
+                        .padding(horizontal = 16.dp, vertical = 14.dp),
                     verticalArrangement = Arrangement.SpaceBetween
                 ) {
-                    // Top Bar
+                    // Top Bar with Prominent Rotate Pill, Playlist Drawer, Audio, and Subtitles
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
@@ -2032,14 +2092,30 @@ fun PlayerScreen(
                         }
 
                         Column(
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            modifier = Modifier.weight(1f).padding(horizontal = 8.dp)
+                            horizontalAlignment = Alignment.Start,
+                            modifier = Modifier.weight(1f).padding(horizontal = 6.dp)
                         ) {
-                            Text(media.title, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 15.sp, maxLines = 1)
-                            Text("${media.resolution} • ${media.videoCodec} • ${media.audioSpec}", color = Color(0xFFF97316), fontSize = 11.sp, maxLines = 1)
+                            Text(media.title, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 14.sp, maxLines = 1)
+                            Text("${media.resolution} • ${media.videoCodec} • ${media.audioSpec}", color = Color(0xFFF97316), fontSize = 10.sp, maxLines = 1)
                         }
 
-                        Row(verticalAlignment = Alignment.CenterVertically) {
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                            // Prominent Rotate Screen Button in Top Bar
+                            FilledTonalButton(
+                                onClick = { toggleScreenRotation() },
+                                colors = ButtonDefaults.filledTonalButtonColors(containerColor = Color(0x33F97316)),
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                shape = RoundedCornerShape(8.dp),
+                                modifier = Modifier.height(34.dp)
+                            ) {
+                                Icon(Icons.Default.ScreenRotation, contentDescription = "Rotate", tint = Color(0xFFF97316), modifier = Modifier.size(15.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(if (isLandscape) "Portrait" else "Landscape", color = Color(0xFFF97316), fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            }
+
+                            IconButton(onClick = { showPlaylistDialog = true }) {
+                                Icon(Icons.Default.PlaylistPlay, contentDescription = "Playlist", tint = Color.White)
+                            }
                             IconButton(onClick = {
                                 refreshVlcTracks()
                                 showAudioDialog = true
@@ -2052,26 +2128,13 @@ fun PlayerScreen(
                             }) {
                                 Icon(Icons.Default.Subtitles, contentDescription = "Subtitles", tint = Color.White)
                             }
-                            TextButton(onClick = {
-                                val speeds = listOf(0.75f, 1.0f, 1.25f, 1.5f, 2.0f)
-                                val next = speeds[(speeds.indexOf(playbackSpeed) + 1) % speeds.size]
-                                playbackSpeed = next
-                                vlcPlayer.rate = next
-                            }) {
-                                Text("${playbackSpeed}x", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                            }
-                            TextButton(onClick = {
-                                currentScaleIdx = (currentScaleIdx + 1) % scaleTypes.size
-                            }) {
-                                Text(scaleLabels[currentScaleIdx], color = Color(0xFFF97316), fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                            }
                             IconButton(onClick = { showInfoDialog = true }) {
                                 Icon(Icons.Default.Info, contentDescription = "Stream Info", tint = Color.White)
                             }
                         }
                     }
 
-                    // Center Transport Controls: Previous Video | -10s | Play/Pause | +10s | Next Video
+                    // Center Transport Controls: Always-Enabled Skip Previous | -10s | Play/Pause | +10s | Skip Next
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceEvenly,
@@ -2082,44 +2145,42 @@ fun PlayerScreen(
                                 repository.savePlaybackPosition(media, currentPosition, totalDuration)
                                 onSkipPrevious()
                             },
-                            enabled = hasPrevious
+                            modifier = Modifier.size(52.dp).background(Color.White.copy(alpha = 0.12f), CircleShape)
                         ) {
                             Icon(
                                 Icons.Default.SkipPrevious,
                                 contentDescription = "Previous Video",
-                                tint = if (hasPrevious) Color.White else Color.White.copy(alpha = 0.3f),
-                                modifier = Modifier.size(36.dp)
+                                tint = Color.White,
+                                modifier = Modifier.size(32.dp)
                             )
                         }
 
-                        IconButton(onClick = {
-                            val target = (currentPosition - 10_000L).coerceAtLeast(0L)
-                            vlcPlayer.time = target
-                            currentPosition = target
-                        }) {
-                            Icon(Icons.Default.Replay10, contentDescription = "-10s", tint = Color.White, modifier = Modifier.size(36.dp))
+                        IconButton(
+                            onClick = { seekRelativeMs(-10_000L) },
+                            modifier = Modifier.size(52.dp).background(Color.White.copy(alpha = 0.12f), CircleShape)
+                        ) {
+                            Icon(Icons.Default.Replay10, contentDescription = "-10s", tint = Color.White, modifier = Modifier.size(30.dp))
                         }
 
                         IconButton(
                             onClick = {
                                 if (vlcPlayer.isPlaying) vlcPlayer.pause() else vlcPlayer.play()
                             },
-                            modifier = Modifier.size(72.dp).background(Color(0xFFF97316), CircleShape)
+                            modifier = Modifier.size(74.dp).background(Color(0xFFF97316), CircleShape)
                         ) {
                             Icon(
                                 if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
                                 contentDescription = "Play/Pause",
                                 tint = Color.White,
-                                modifier = Modifier.size(38.dp)
+                                modifier = Modifier.size(40.dp)
                             )
                         }
 
-                        IconButton(onClick = {
-                            val target = (currentPosition + 10_000L).coerceAtMost(totalDuration)
-                            vlcPlayer.time = target
-                            currentPosition = target
-                        }) {
-                            Icon(Icons.Default.Forward10, contentDescription = "+10s", tint = Color.White, modifier = Modifier.size(36.dp))
+                        IconButton(
+                            onClick = { seekRelativeMs(10_000L) },
+                            modifier = Modifier.size(52.dp).background(Color.White.copy(alpha = 0.12f), CircleShape)
+                        ) {
+                            Icon(Icons.Default.Forward10, contentDescription = "+10s", tint = Color.White, modifier = Modifier.size(30.dp))
                         }
 
                         IconButton(
@@ -2127,62 +2188,127 @@ fun PlayerScreen(
                                 repository.savePlaybackPosition(media, currentPosition, totalDuration)
                                 onSkipNext()
                             },
-                            enabled = hasNext
+                            modifier = Modifier.size(52.dp).background(Color.White.copy(alpha = 0.12f), CircleShape)
                         ) {
                             Icon(
                                 Icons.Default.SkipNext,
                                 contentDescription = "Next Video",
-                                tint = if (hasNext) Color.White else Color.White.copy(alpha = 0.3f),
-                                modifier = Modifier.size(36.dp)
+                                tint = Color.White,
+                                modifier = Modifier.size(32.dp)
                             )
                         }
                     }
 
-                    // Bottom Scrubber & Lock / Rotate Controls
+                    // Bottom Scrubber & Quick Pill Controls (Rotate, Aspect Ratio, Speed, Lock)
                     Column(modifier = Modifier.fillMaxWidth()) {
+                        val sliderVal = if (isUserScrubbing) {
+                            scrubFraction
+                        } else if (totalDuration > 0) {
+                            (currentPosition.toFloat() / totalDuration.toFloat()).coerceIn(0f, 1f)
+                        } else 0f
+
                         Slider(
-                            value = if (totalDuration > 0) (currentPosition.toFloat() / totalDuration).coerceIn(0f, 1f) else 0f,
+                            value = sliderVal,
                             onValueChange = { frac ->
-                                val target = (frac * totalDuration).toLong()
-                                vlcPlayer.time = target
-                                currentPosition = target
+                                isUserScrubbing = true
+                                scrubFraction = frac
+                                currentPosition = (frac * totalDuration).toLong()
+                            },
+                            onValueChangeFinished = {
+                                val target = (scrubFraction * totalDuration).toLong()
+                                seekUniversalToMs(target)
+                                isUserScrubbing = false
                             },
                             colors = SliderDefaults.colors(thumbColor = Color.White, activeTrackColor = Color(0xFFF97316))
                         )
+
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                IconButton(onClick = { isControlsLocked = true }, modifier = Modifier.size(28.dp)) {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                IconButton(onClick = { isControlsLocked = true }, modifier = Modifier.size(30.dp)) {
                                     Icon(Icons.Default.LockOpen, contentDescription = "Lock Screen", tint = Color.LightGray, modifier = Modifier.size(18.dp))
                                 }
-                                Text(formatMs(currentPosition), color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                                Text("${formatMs(currentPosition)} / ${formatMs(totalDuration)}", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                             }
 
-                            Text("LibVLC Universal • ${media.audioSpec}", color = Color(0xFF38BDF8), fontSize = 11.sp, fontWeight = FontWeight.Medium)
-
                             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                Text(formatMs(totalDuration), color = Color.LightGray, fontSize = 12.sp)
+                                TextButton(onClick = {
+                                    val speeds = listOf(0.75f, 1.0f, 1.25f, 1.5f, 2.0f)
+                                    val next = speeds[(speeds.indexOf(playbackSpeed) + 1) % speeds.size]
+                                    playbackSpeed = next
+                                    vlcPlayer.rate = next
+                                }) {
+                                    Text("${playbackSpeed}x", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                                }
+
+                                TextButton(onClick = {
+                                    currentScaleIdx = (currentScaleIdx + 1) % scaleTypes.size
+                                }) {
+                                    Text(scaleLabels[currentScaleIdx], color = Color(0xFFF97316), fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                                }
+
                                 IconButton(
-                                    onClick = {
-                                        isLandscape = !isLandscape
-                                        activity?.requestedOrientation = if (isLandscape) {
-                                            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-                                        } else {
-                                            ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-                                        }
-                                    },
-                                    modifier = Modifier.size(28.dp)
+                                    onClick = { toggleScreenRotation() },
+                                    modifier = Modifier.size(32.dp).background(Color.White.copy(alpha = 0.15f), CircleShape)
                                 ) {
-                                    Icon(Icons.Default.ScreenRotation, contentDescription = "Rotate Screen", tint = Color.LightGray, modifier = Modifier.size(18.dp))
+                                    Icon(Icons.Default.ScreenRotation, contentDescription = "Rotate Screen", tint = Color.White, modifier = Modifier.size(18.dp))
                                 }
                             }
                         }
                     }
                 }
             }
+        }
+
+        // In-Player Video Playlist Queue Dialog (Jump to any video directly!)
+        if (showPlaylistDialog) {
+            AlertDialog(
+                onDismissRequest = { showPlaylistDialog = false },
+                containerColor = Color(0xFF141720),
+                title = { Text("Switch Video (${playlist.size} in Library)", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp) },
+                text = {
+                    Column(
+                        modifier = Modifier.heightIn(max = 280.dp).verticalScroll(rememberScrollState()),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        playlist.forEachIndexed { idx, item ->
+                            val isCurrent = item.id == media.id || item.rawFilename.equals(media.rawFilename, ignoreCase = true)
+                            Card(
+                                colors = CardDefaults.cardColors(
+                                    containerColor = if (isCurrent) Color(0x33F97316) else Color(0xFF1E222D)
+                                ),
+                                modifier = Modifier.fillMaxWidth().clickable {
+                                    repository.savePlaybackPosition(media, currentPosition, totalDuration)
+                                    showPlaylistDialog = false
+                                    onSelectVideoFromPlaylist(item)
+                                }
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(12.dp).fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text("${idx + 1}. ${item.title}", color = if (isCurrent) Color(0xFFF97316) else Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+                                        Text("${item.qualityTag} • ${item.durationText}", color = Color.Gray, fontSize = 11.sp)
+                                    }
+                                    if (isCurrent) {
+                                        Icon(Icons.Default.PlayArrow, contentDescription = null, tint = Color(0xFFF97316))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = { showPlaylistDialog = false }) {
+                        Text("Close", color = Color(0xFFF97316))
+                    }
+                }
+            )
         }
 
         if (showAudioDialog) {
@@ -2434,27 +2560,34 @@ class MainActivity : ComponentActivity() {
 
                 if (activePlayback != null) {
                     val currentItem = activePlayback!!.first
-                    val currentIndex = mediaList.indexOfFirst {
-                        it.id == currentItem.id || it.rawFilename.equals(currentItem.rawFilename, ignoreCase = true)
-                    }
-                    val hasPrev = currentIndex > 0
-                    val hasNext = currentIndex != -1 && currentIndex < mediaList.size - 1
+                    val list = mediaList.ifEmpty { listOf(currentItem) }
+                    val currentIndex = list.indexOfFirst {
+                        it.id == currentItem.id || it.rawFilename.equals(currentItem.rawFilename, ignoreCase = true) || it.streamUri == currentItem.streamUri
+                    }.let { if (it == -1) 0 else it }
 
                     PlayerScreen(
                         media = currentItem,
+                        playlist = list,
                         initialSeekMs = activePlayback!!.second,
-                        hasPrevious = hasPrev,
-                        hasNext = hasNext,
+                        onSelectVideoFromPlaylist = { chosen ->
+                            activePlayback = chosen to repository.getSavedPosition(chosen)
+                        },
                         onSkipPrevious = {
-                            if (hasPrev) {
-                                val prevItem = mediaList[currentIndex - 1]
+                            if (list.size > 1) {
+                                val prevIndex = if (currentIndex > 0) currentIndex - 1 else list.size - 1
+                                val prevItem = list[prevIndex]
                                 activePlayback = prevItem to repository.getSavedPosition(prevItem)
+                            } else {
+                                activePlayback = currentItem to 0L
                             }
                         },
                         onSkipNext = {
-                            if (hasNext) {
-                                val nextItem = mediaList[currentIndex + 1]
+                            if (list.size > 1) {
+                                val nextIndex = (currentIndex + 1) % list.size
+                                val nextItem = list[nextIndex]
                                 activePlayback = nextItem to repository.getSavedPosition(nextItem)
+                            } else {
+                                activePlayback = currentItem to 0L
                             }
                         },
                         repository = repository,
@@ -2524,8 +2657,8 @@ android {
         applicationId = "com.infuse.player"
         minSdk = 26
         targetSdk = 35
-        versionCode = 5
-        versionName = "5.0.0"
+        versionCode = 6
+        versionName = "6.0.0"
     }
 
     compileOptions {

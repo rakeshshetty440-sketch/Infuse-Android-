@@ -90,10 +90,51 @@ data class MediaItem(
     val synopsis: String = "Tap poster to inspect full track details or start playback.",
     val savedPositionMs: Long = 0L,
     val isWatched: Boolean = false,
+    val isTmdbSynced: Boolean = false,
     val hasDeepSpecs: Boolean = false
 ) {
     val progressFraction: Float
         get() = if (durationSeconds > 0) (savedPositionMs.toFloat() / (durationSeconds * 1000f)).coerceIn(0f, 1f) else 0f
+
+    fun toJson(): org.json.JSONObject = org.json.JSONObject().apply {
+        put("id", id); put("title", title); put("rawFilename", rawFilename)
+        put("folderName", folderName); put("filePath", filePath); put("year", year)
+        put("isTvShow", isTvShow)
+        if (seasonNumber != null) put("seasonNumber", seasonNumber)
+        if (episodeNumber != null) put("episodeNumber", episodeNumber)
+        put("durationText", durationText); put("durationSeconds", durationSeconds)
+        put("rating", rating); put("qualityTag", qualityTag); put("resolution", resolution)
+        put("frameRate", frameRate); put("hdrFormat", hdrFormat); put("audioSpec", audioSpec)
+        put("audioDetails", audioDetails); put("videoCodec", videoCodec); put("container", container)
+        put("bitrate", bitrate); put("fileSize", fileSize); put("sizeBytes", sizeBytes)
+        put("subtitleSummary", subtitleSummary); put("streamUri", streamUri)
+        put("posterUrl", posterUrl); put("backdropUrl", backdropUrl); put("synopsis", synopsis)
+        put("savedPositionMs", savedPositionMs); put("isWatched", isWatched)
+        put("isTmdbSynced", isTmdbSynced); put("hasDeepSpecs", hasDeepSpecs)
+    }
+
+    companion object {
+        fun fromJson(obj: org.json.JSONObject): MediaItem = MediaItem(
+            id = obj.optString("id"), title = obj.optString("title", "Video"),
+            rawFilename = obj.optString("rawFilename", ""), folderName = obj.optString("folderName", "Videos"),
+            filePath = obj.optString("filePath", ""), year = obj.optInt("year", 2026),
+            isTvShow = obj.optBoolean("isTvShow", false),
+            seasonNumber = if (obj.has("seasonNumber")) obj.optInt("seasonNumber") else null,
+            episodeNumber = if (obj.has("episodeNumber")) obj.optInt("episodeNumber") else null,
+            durationText = obj.optString("durationText", "--"), durationSeconds = obj.optLong("durationSeconds", 0L),
+            rating = obj.optString("rating", "8.4"), qualityTag = obj.optString("qualityTag", "1080p FHD"),
+            resolution = obj.optString("resolution", "1920x1080"), frameRate = obj.optString("frameRate", "24 fps"),
+            hdrFormat = obj.optString("hdrFormat", "SDR (8-bit)"), audioSpec = obj.optString("audioSpec", "Multi-Track Audio"),
+            audioDetails = obj.optString("audioDetails", "48.0 kHz • Stereo"), videoCodec = obj.optString("videoCodec", "HEVC / H.264"),
+            container = obj.optString("container", "MKV"), bitrate = obj.optString("bitrate", "--"),
+            fileSize = obj.optString("fileSize", "--"), sizeBytes = obj.optLong("sizeBytes", 0L),
+            subtitleSummary = obj.optString("subtitleSummary", "Embedded & External (.SRT/.ASS)"),
+            streamUri = obj.optString("streamUri", ""), posterUrl = obj.optString("posterUrl", ""),
+            backdropUrl = obj.optString("backdropUrl", ""), synopsis = obj.optString("synopsis", ""),
+            savedPositionMs = obj.optLong("savedPositionMs", 0L), isWatched = obj.optBoolean("isWatched", false),
+            isTmdbSynced = obj.optBoolean("isTmdbSynced", false), hasDeepSpecs = obj.optBoolean("hasDeepSpecs", false)
+        )
+    }
 }
 
 data class TmdbSearchCandidate(
@@ -219,7 +260,8 @@ class TmdbScraperService(
                 rating = best.rating,
                 posterUrl = best.posterUrl.ifEmpty { item.posterUrl },
                 backdropUrl = best.backdropUrl.ifEmpty { item.backdropUrl },
-                synopsis = best.synopsis.ifEmpty { item.synopsis }
+                synopsis = best.synopsis.ifEmpty { item.synopsis },
+                isTmdbSynced = true
             )
         }
 
@@ -229,7 +271,8 @@ class TmdbScraperService(
             isTvShow = parsed.isTv,
             seasonNumber = parsed.season,
             episodeNumber = parsed.episode,
-            synopsis = "Local video (${item.rawFilename}) in ${item.folderName} • ${item.resolution} • ${item.fileSize}"
+            synopsis = "Local video (${item.rawFilename}) in ${item.folderName} • ${item.resolution} • ${item.fileSize}",
+            isTmdbSynced = true
         )
     }
 
@@ -324,6 +367,36 @@ class MediaRepository(private val context: Context) {
     private val _isScanning = MutableStateFlow(false)
     val isScanning: StateFlow<Boolean> = _isScanning.asStateFlow()
 
+    init {
+        val cached = loadLibraryCache()
+        if (cached.isNotEmpty()) {
+            _mediaList.value = cached
+        }
+    }
+
+    private fun saveLibraryCache(list: List<MediaItem>) {
+        try {
+            val arr = JSONArray()
+            for (item in list) arr.put(item.toJson())
+            prefs.edit().putString("lib_cache_v7", arr.toString()).commit()
+        } catch (_: Exception) {}
+    }
+
+    private fun loadLibraryCache(): List<MediaItem> {
+        val list = mutableListOf<MediaItem>()
+        try {
+            val raw = prefs.getString("lib_cache_v7", null) ?: return emptyList()
+            val arr = JSONArray(raw)
+            for (i in 0 until arr.length()) {
+                val item = MediaItem.fromJson(arr.getJSONObject(i))
+                val pos = prefs.getLong(resumeKey(item.rawFilename, item.streamUri), item.savedPositionMs)
+                val watched = prefs.getBoolean(watchedKey(item.rawFilename, item.streamUri), item.isWatched)
+                list.add(item.copy(savedPositionMs = pos, isWatched = watched))
+            }
+        } catch (_: Exception) {}
+        return list
+    }
+
     private fun resumeKey(rawFilename: String, streamUri: String): String {
         val cleanKey = rawFilename.trim().lowercase(Locale.ROOT)
         return if (cleanKey.isNotEmpty()) "pos_file_$cleanKey" else "pos_uri_$streamUri"
@@ -349,7 +422,7 @@ class MediaRepository(private val context: Context) {
         }
         editor.commit()
 
-        _mediaList.value = _mediaList.value.map { current ->
+        val updated = _mediaList.value.map { current ->
             if (current.id == item.id || current.rawFilename.equals(item.rawFilename, ignoreCase = true) || current.streamUri == item.streamUri) {
                 current.copy(
                     savedPositionMs = positionMs,
@@ -358,6 +431,8 @@ class MediaRepository(private val context: Context) {
                 )
             } else current
         }
+        _mediaList.value = updated
+        saveLibraryCache(updated)
     }
 
     fun getSavedPosition(item: MediaItem): Long {
@@ -415,9 +490,12 @@ class MediaRepository(private val context: Context) {
         return list
     }
 
-    fun scanDeviceVideos() {
+    fun scanDeviceVideos(forceRescan: Boolean = false) {
         scope.launch {
-            _isScanning.value = true
+            val cachedByName = _mediaList.value.associateBy { it.rawFilename.lowercase(Locale.ROOT) }
+            if (cachedByName.isEmpty() || forceRescan) {
+                _isScanning.value = true
+            }
             val discovered = mutableListOf<MediaItem>()
             val seenNames = mutableSetOf<String>()
 
@@ -469,18 +547,24 @@ class MediaRepository(private val context: Context) {
                         val h = cursor.getInt(heightCol)
                         val contentUri = ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, id)
 
-                        val fastItem = createFastMediaItem(
-                            id = "local_$id",
-                            name = name,
-                            folderName = folder,
-                            filePath = path,
-                            uri = contentUri,
-                            durationMs = durationMs,
-                            sizeBytes = sizeBytes,
-                            width = w,
-                            height = h
-                        )
-                        discovered.add(fastItem)
+                        val existing = cachedByName[name.lowercase(Locale.ROOT)]
+                        if (existing != null && existing.isTmdbSynced && !forceRescan) {
+                            val latestPos = getSavedPosition(existing)
+                            discovered.add(existing.copy(savedPositionMs = latestPos))
+                        } else {
+                            val fastItem = createFastMediaItem(
+                                id = "local_$id",
+                                name = name,
+                                folderName = folder,
+                                filePath = path,
+                                uri = contentUri,
+                                durationMs = durationMs,
+                                sizeBytes = sizeBytes,
+                                width = w,
+                                height = h
+                            )
+                            discovered.add(fastItem)
+                        }
                     }
                 }
             } catch (_: Exception) {}
@@ -490,11 +574,14 @@ class MediaRepository(private val context: Context) {
             }
 
             _mediaList.value = discovered
+            saveLibraryCache(discovered)
             _isScanning.value = false
 
             val working = discovered.toMutableList()
+            var changed = false
             for (i in working.indices) {
                 val item = working[i]
+                if (item.isTmdbSynced && !forceRescan) continue
                 val customTitle = prefs.getString("custom_title_${item.rawFilename}", null)
                 if (customTitle != null) {
                     working[i] = item.copy(
@@ -503,12 +590,17 @@ class MediaRepository(private val context: Context) {
                         posterUrl = prefs.getString("custom_poster_${item.rawFilename}", item.posterUrl) ?: item.posterUrl,
                         backdropUrl = prefs.getString("custom_backdrop_${item.rawFilename}", item.backdropUrl) ?: item.backdropUrl,
                         synopsis = prefs.getString("custom_synopsis_${item.rawFilename}", item.synopsis) ?: item.synopsis,
-                        rating = prefs.getString("custom_rating_${item.rawFilename}", item.rating) ?: item.rating
+                        rating = prefs.getString("custom_rating_${item.rawFilename}", item.rating) ?: item.rating,
+                        isTmdbSynced = true
                     )
                 } else {
                     working[i] = scraper.enrichWithMetadata(item)
                 }
                 _mediaList.value = working.toList()
+                changed = true
+            }
+            if (changed) {
+                saveLibraryCache(working)
             }
         }
     }
@@ -1328,7 +1420,7 @@ fun LibraryScreen(
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Text("Infuse", fontWeight = FontWeight.ExtraBold, color = Color.White, fontSize = 20.sp)
                             Badge(containerColor = Color(0x33F97316), contentColor = Color(0xFFF97316)) {
-                                Text("PRO v6.0", fontSize = 9.sp, fontWeight = FontWeight.Black)
+                                Text("PRO v7.0", fontSize = 9.sp, fontWeight = FontWeight.Black)
                             }
                         }
                     },
@@ -2600,7 +2692,7 @@ class MainActivity : ComponentActivity() {
                             activePlayback = media to startPosMs
                         },
                         onPickLocalFile = { filePickerLauncher.launch(arrayOf("video/*", "application/octet-stream", "*/*")) },
-                        onRescanStorage = { repository.scanDeviceVideos() }
+                        onRescanStorage = { repository.scanDeviceVideos(forceRescan = true) }
                     )
                 }
             }
@@ -2657,8 +2749,8 @@ android {
         applicationId = "com.infuse.player"
         minSdk = 26
         targetSdk = 35
-        versionCode = 6
-        versionName = "6.0.0"
+        versionCode = 7
+        versionName = "7.0.0"
     }
 
     compileOptions {

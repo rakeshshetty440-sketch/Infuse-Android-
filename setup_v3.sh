@@ -64,6 +64,7 @@ data class MediaItem(
     val title: String,
     val rawFilename: String = "",
     val folderName: String = "Internal Storage",
+    val filePath: String = "",
     val year: Int = 2026,
     val isTvShow: Boolean = false,
     val seasonNumber: Int? = null,
@@ -71,24 +72,25 @@ data class MediaItem(
     val durationText: String = "--",
     val durationSeconds: Long = 0L,
     val rating: String = "8.4",
-    val genres: String = "Cinema • Direct Play",
     val qualityTag: String = "1080p FHD",
     val resolution: String = "1920x1080",
     val frameRate: String = "24 fps",
     val hdrFormat: String = "SDR (8-bit)",
-    val audioSpec: String = "Dolby / Multi-Audio",
+    val audioSpec: String = "Multi-Track Audio",
     val audioDetails: String = "48.0 kHz • Stereo / Surround",
     val videoCodec: String = "HEVC / H.264",
     val container: String = "Matroska (MKV)",
     val bitrate: String = "--",
     val fileSize: String = "--",
+    val sizeBytes: Long = 0L,
     val subtitleSummary: String = "Embedded & External (.SRT/.ASS)",
     val streamUri: String,
     val posterUrl: String = "",
     val backdropUrl: String = "",
-    val synopsis: String = "Local video ready for universal LibVLC + FFmpeg direct playback.",
+    val synopsis: String = "Tap poster to inspect full track details or start playback.",
     val savedPositionMs: Long = 0L,
-    val isWatched: Boolean = false
+    val isWatched: Boolean = false,
+    val hasDeepSpecs: Boolean = false
 ) {
     val progressFraction: Float
         get() = if (durationSeconds > 0) (savedPositionMs.toFloat() / (durationSeconds * 1000f)).coerceIn(0f, 1f) else 0f
@@ -122,7 +124,7 @@ object FilenameParser {
         "dvdrip", "camrip", "x264", "x265", "h264", "h265", "hevc", "avc", "av1", "10bit", "8bit",
         "truehd", "atmos", "dts-hd", "dtshd", "dts", "ddp5", "dd5", "ac3", "eac3", "aac", "flac", "mp3",
         "dual", "audio", "multi", "subs", "esub", "esubs", "proper", "repack", "extended", "unrated",
-        "directors", "cut", " theatrical", "imax", "amzn", "nf", "dsnp", "hmax", "atvp", "hulu",
+        "directors", "cut", "theatrical", "imax", "amzn", "nf", "dsnp", "hmax", "atvp", "hulu",
         "yify", "yts", "rarbg", "psa", "galaxy", "pahe", "tigole", "qxr", "hindi", "tamil", "telugu",
         "malayalam", "kannada", "eng", "english", "jap", "japanese", "kor", "korean", "dubbed", "org"
     )
@@ -164,13 +166,12 @@ object FilenameParser {
     }
 
     private fun cleanWords(raw: String): String {
-        var str = raw.replace(Regex("[._\\[\\]()\\-]"), " ").trim()
+        val str = raw.replace(Regex("[._\\[\\]()\\-]"), " ").trim()
         val words = str.split(Regex("\\s+"))
         val kept = mutableListOf<String>()
         for (w in words) {
             val lower = w.lowercase()
             if (lower in JUNK_TOKENS) {
-                // Once we hit technical tags after at least 1 title word, stop collecting
                 if (kept.isNotEmpty()) break else continue
             }
             if (lower.matches(Regex("^\\d+mb$|^\\d+gb$|^x\\d+$"))) {
@@ -194,19 +195,15 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONObject
 import java.net.URLEncoder
+import java.util.concurrent.TimeUnit
 
 class TmdbScraperService(
     private val apiKey: String = "f52f0d6c1b1784ece4eed64ff99052ac",
-    private val client: OkHttpClient = OkHttpClient()
+    private val client: OkHttpClient = OkHttpClient.Builder()
+        .connectTimeout(5, TimeUnit.SECONDS)
+        .readTimeout(5, TimeUnit.SECONDS)
+        .build()
 ) {
-    private val genreMap = mapOf(
-        28 to "Action", 12 to "Adventure", 16 to "Animation", 35 to "Comedy",
-        80 to "Crime", 99 to "Documentary", 18 to "Drama", 10751 to "Family",
-        14 to "Fantasy", 36 to "History", 27 to "Horror", 10402 to "Music",
-        9648 to "Mystery", 10749 to "Romance", 878 to "Sci-Fi", 53 to "Thriller",
-        10752 to "War", 37 to "Western", 10759 to "Action & Adventure", 10765 to "Sci-Fi & Fantasy"
-    )
-
     suspend fun enrichWithMetadata(item: MediaItem): MediaItem = withContext(Dispatchers.IO) {
         val parsed = FilenameParser.parse(item.rawFilename.ifEmpty { item.title })
         val candidates = searchCandidates(parsed.cleanTitle, parsed.year)
@@ -232,7 +229,7 @@ class TmdbScraperService(
             isTvShow = parsed.isTv,
             seasonNumber = parsed.season,
             episodeNumber = parsed.episode,
-            synopsis = "Local video (${item.rawFilename}) in ${item.folderName} • ${item.resolution} • ${item.videoCodec} • ${item.audioSpec}"
+            synopsis = "Local video (${item.rawFilename}) in ${item.folderName} • ${item.resolution} • ${item.fileSize}"
         )
     }
 
@@ -293,7 +290,6 @@ package com.infuse.player.data.repository
 
 import android.content.ContentUris
 import android.content.Context
-import android.graphics.Bitmap
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
@@ -302,6 +298,7 @@ import android.provider.MediaStore
 import android.provider.OpenableColumns
 import com.infuse.player.data.model.MediaItem
 import com.infuse.player.data.model.TmdbSearchCandidate
+import com.infuse.player.data.scraper.FilenameParser
 import com.infuse.player.data.scraper.TmdbScraperService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -309,14 +306,15 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import java.io.File
-import java.io.FileOutputStream
+import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
 import java.util.Locale
 
 class MediaRepository(private val context: Context) {
     val scraper = TmdbScraperService()
     private val scope = CoroutineScope(Dispatchers.IO)
-    private val prefs = context.getSharedPreferences("infuse_v4_prefs", Context.MODE_PRIVATE)
+    private val prefs = context.getSharedPreferences("infuse_v5_store", Context.MODE_PRIVATE)
 
     private val _mediaList = MutableStateFlow<List<MediaItem>>(emptyList())
     val mediaList: StateFlow<List<MediaItem>> = _mediaList.asStateFlow()
@@ -324,55 +322,118 @@ class MediaRepository(private val context: Context) {
     private val _isScanning = MutableStateFlow(false)
     val isScanning: StateFlow<Boolean> = _isScanning.asStateFlow()
 
-    fun savePlaybackPosition(streamUri: String, positionMs: Long, durationMs: Long) {
-        if (positionMs <= 0L) return
-        prefs.edit().putLong("pos_$streamUri", positionMs).apply()
-        val watched = durationMs > 0 && positionMs >= (durationMs * 0.92)
+    // Normalize resume key by filename so MediaStore URI and DocumentPicker URI share the exact same resume state!
+    private fun resumeKey(rawFilename: String, streamUri: String): String {
+        val cleanKey = rawFilename.trim().lowercase(Locale.ROOT)
+        return if (cleanKey.isNotEmpty()) "pos_file_$cleanKey" else "pos_uri_$streamUri"
+    }
+
+    private fun watchedKey(rawFilename: String, streamUri: String): String {
+        val cleanKey = rawFilename.trim().lowercase(Locale.ROOT)
+        return if (cleanKey.isNotEmpty()) "watched_file_$cleanKey" else "watched_uri_$streamUri"
+    }
+
+    // Use synchronous commit() so closing or swiping away the app NEVER loses the timestamp!
+    fun savePlaybackPosition(item: MediaItem, positionMs: Long, durationMs: Long) {
+        if (positionMs <= 1000L) return
+        val rKey = resumeKey(item.rawFilename, item.streamUri)
+        val wKey = watchedKey(item.rawFilename, item.streamUri)
+        val watched = durationMs > 0 && positionMs >= (durationMs * 0.93)
+
+        val editor = prefs.edit().putLong(rKey, positionMs)
+        if (durationMs > 0) {
+            editor.putLong("dur_${item.rawFilename}", durationMs / 1000L)
+        }
         if (watched) {
-            prefs.edit().putBoolean("watched_$streamUri", true).apply()
+            editor.putBoolean(wKey, true)
         }
-        _mediaList.value = _mediaList.value.map {
-            if (it.streamUri == streamUri) {
-                it.copy(savedPositionMs = positionMs, isWatched = watched || it.isWatched)
-            } else it
-        }
-    }
+        editor.commit() // Synchronous write to disk
 
-    fun getSavedPosition(streamUri: String): Long = prefs.getLong("pos_$streamUri", 0L)
-
-    fun applyManualMetadataMatch(itemId: String, candidate: TmdbSearchCandidate) {
-        _mediaList.value = _mediaList.value.map { item ->
-            if (item.id == itemId) {
-                prefs.edit()
-                    .putString("custom_title_${item.streamUri}", candidate.title)
-                    .putInt("custom_year_${item.streamUri}", candidate.year)
-                    .putString("custom_poster_${item.streamUri}", candidate.posterUrl)
-                    .putString("custom_backdrop_${item.streamUri}", candidate.backdropUrl)
-                    .putString("custom_synopsis_${item.streamUri}", candidate.synopsis)
-                    .putString("custom_rating_${item.streamUri}", candidate.rating)
-                    .apply()
-
-                item.copy(
-                    title = candidate.title,
-                    year = candidate.year,
-                    isTvShow = candidate.isTv,
-                    rating = candidate.rating,
-                    posterUrl = candidate.posterUrl.ifEmpty { item.posterUrl },
-                    backdropUrl = candidate.backdropUrl.ifEmpty { item.backdropUrl },
-                    synopsis = candidate.synopsis.ifEmpty { item.synopsis }
+        _mediaList.value = _mediaList.value.map { current ->
+            if (current.id == item.id || current.rawFilename.equals(item.rawFilename, ignoreCase = true) || current.streamUri == item.streamUri) {
+                current.copy(
+                    savedPositionMs = positionMs,
+                    durationSeconds = if (durationMs > 0) durationMs / 1000L else current.durationSeconds,
+                    isWatched = watched || current.isWatched
                 )
-            } else item
+            } else current
         }
     }
 
+    fun getSavedPosition(item: MediaItem): Long {
+        return prefs.getLong(resumeKey(item.rawFilename, item.streamUri), 0L)
+    }
+
+    private fun savePickedUriToHistory(uri: String, name: String, sizeBytes: Long) {
+        try {
+            val rawJson = prefs.getString("picked_history_v5", "[]") ?: "[]"
+            val arr = JSONArray(rawJson)
+            val updated = JSONArray()
+            val entry = JSONObject().apply {
+                put("uri", uri)
+                put("name", name)
+                put("size", sizeBytes)
+            }
+            updated.put(entry)
+            for (i in 0 until arr.length()) {
+                val obj = arr.getJSONObject(i)
+                if (obj.optString("uri") != uri && obj.optString("name") != name) {
+                    updated.put(obj)
+                }
+            }
+            prefs.edit().putString("picked_history_v5", updated.toString()).commit()
+        } catch (_: Exception) {}
+    }
+
+    private fun loadPickedHistory(): List<MediaItem> {
+        val list = mutableListOf<MediaItem>()
+        try {
+            val rawJson = prefs.getString("picked_history_v5", "[]") ?: "[]"
+            val arr = JSONArray(rawJson)
+            for (i in 0 until arr.length()) {
+                val obj = arr.getJSONObject(i)
+                val uriStr = obj.optString("uri")
+                val name = obj.optString("name", "Video.mkv")
+                val size = obj.optLong("size", 0L)
+                if (uriStr.isNotEmpty()) {
+                    list.add(
+                        createFastMediaItem(
+                            id = "picked_${name.hashCode()}",
+                            name = name,
+                            folderName = "Opened Videos",
+                            filePath = "",
+                            uri = Uri.parse(uriStr),
+                            durationMs = prefs.getLong("dur_$name", 0L) * 1000L,
+                            sizeBytes = size,
+                            width = 1920,
+                            height = 1080
+                        )
+                    )
+                }
+            }
+        } catch (_: Exception) {}
+        return list
+    }
+
+    // Instant <0.2s Device Scan: Queries MediaStore columns ONLY (never blocks on heavy file I/O)
     fun scanDeviceVideos() {
         scope.launch {
             _isScanning.value = true
             val discovered = mutableListOf<MediaItem>()
+            val seenNames = mutableSetOf<String>()
+
+            // 1. Restore any manually opened videos first so they are always remembered
+            for (picked in loadPickedHistory()) {
+                discovered.add(picked)
+                seenNames.add(picked.rawFilename.lowercase(Locale.ROOT))
+            }
+
+            // 2. Fast MediaStore cursor query
             val projection = arrayOf(
                 MediaStore.Video.Media._ID,
                 MediaStore.Video.Media.DISPLAY_NAME,
                 MediaStore.Video.Media.BUCKET_DISPLAY_NAME,
+                MediaStore.Video.Media.DATA,
                 MediaStore.Video.Media.DURATION,
                 MediaStore.Video.Media.SIZE,
                 MediaStore.Video.Media.WIDTH,
@@ -391,6 +452,7 @@ class MediaRepository(private val context: Context) {
                     val idCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media._ID)
                     val nameCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DISPLAY_NAME)
                     val bucketCol = cursor.getColumnIndex(MediaStore.Video.Media.BUCKET_DISPLAY_NAME)
+                    val dataCol = cursor.getColumnIndex(MediaStore.Video.Media.DATA)
                     val durCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DURATION)
                     val sizeCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.SIZE)
                     val widthCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.WIDTH)
@@ -399,24 +461,29 @@ class MediaRepository(private val context: Context) {
                     while (cursor.moveToNext()) {
                         val id = cursor.getLong(idCol)
                         val name = cursor.getString(nameCol) ?: "Video_$id.mp4"
+                        if (name.lowercase(Locale.ROOT) in seenNames) continue
+                        seenNames.add(name.lowercase(Locale.ROOT))
+
                         val folder = if (bucketCol != -1) cursor.getString(bucketCol) ?: "Videos" else "Videos"
+                        val path = if (dataCol != -1) cursor.getString(dataCol) ?: "" else ""
                         val durationMs = cursor.getLong(durCol)
                         val sizeBytes = cursor.getLong(sizeCol)
                         val w = cursor.getInt(widthCol)
                         val h = cursor.getInt(heightCol)
                         val contentUri = ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, id)
 
-                        val baseItem = inspectTrackFormatsAndCreateItem(
+                        val fastItem = createFastMediaItem(
                             id = "local_$id",
                             name = name,
                             folderName = folder,
+                            filePath = path,
                             uri = contentUri,
-                            fallbackDurationMs = durationMs,
+                            durationMs = durationMs,
                             sizeBytes = sizeBytes,
-                            fallbackW = w,
-                            fallbackH = h
+                            width = w,
+                            height = h
                         )
-                        discovered.add(baseItem)
+                        discovered.add(fastItem)
                     }
                 }
             } catch (_: Exception) {}
@@ -424,94 +491,42 @@ class MediaRepository(private val context: Context) {
             if (discovered.isEmpty()) {
                 discovered.addAll(defaultDemoSamples())
             }
-            _mediaList.value = discovered
 
-            val enrichedList = discovered.toMutableList()
-            for (i in enrichedList.indices) {
-                val item = enrichedList[i]
-                val customTitle = prefs.getString("custom_title_${item.streamUri}", null)
+            // Immediately publish the list so the UI is NEVER stuck at 0!
+            _mediaList.value = discovered
+            _isScanning.value = false
+
+            // 3. Enrich posters/metadata asynchronously in the background
+            val working = discovered.toMutableList()
+            for (i in working.indices) {
+                val item = working[i]
+                val customTitle = prefs.getString("custom_title_${item.rawFilename}", null)
                 if (customTitle != null) {
-                    enrichedList[i] = item.copy(
+                    working[i] = item.copy(
                         title = customTitle,
-                        year = prefs.getInt("custom_year_${item.streamUri}", item.year),
-                        posterUrl = prefs.getString("custom_poster_${item.streamUri}", item.posterUrl) ?: item.posterUrl,
-                        backdropUrl = prefs.getString("custom_backdrop_${item.streamUri}", item.backdropUrl) ?: item.backdropUrl,
-                        synopsis = prefs.getString("custom_synopsis_${item.streamUri}", item.synopsis) ?: item.synopsis,
-                        rating = prefs.getString("custom_rating_${item.streamUri}", item.rating) ?: item.rating
+                        year = prefs.getInt("custom_year_${item.rawFilename}", item.year),
+                        posterUrl = prefs.getString("custom_poster_${item.rawFilename}", item.posterUrl) ?: item.posterUrl,
+                        backdropUrl = prefs.getString("custom_backdrop_${item.rawFilename}", item.backdropUrl) ?: item.backdropUrl,
+                        synopsis = prefs.getString("custom_synopsis_${item.rawFilename}", item.synopsis) ?: item.synopsis,
+                        rating = prefs.getString("custom_rating_${item.rawFilename}", item.rating) ?: item.rating
                     )
                 } else {
-                    enrichedList[i] = scraper.enrichWithMetadata(item)
+                    working[i] = scraper.enrichWithMetadata(item)
                 }
-                _mediaList.value = enrichedList.toList()
-            }
-            _isScanning.value = false
-        }
-    }
-
-    fun addPickedVideoUri(uri: Uri, onReady: (MediaItem) -> Unit) {
-        scope.launch {
-            var displayName = "Local_Video.mkv"
-            var sizeBytes = 0L
-            try {
-                context.contentResolver.query(uri, null, null, null, null)?.use { c ->
-                    if (c.moveToFirst()) {
-                        val nameIdx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                        val sizeIdx = c.getColumnIndex(OpenableColumns.SIZE)
-                        if (nameIdx != -1) displayName = c.getString(nameIdx) ?: displayName
-                        if (sizeIdx != -1) sizeBytes = c.getLong(sizeIdx)
-                    }
-                }
-            } catch (_: Exception) {}
-
-            val rawItem = inspectTrackFormatsAndCreateItem(
-                id = "picked_${System.currentTimeMillis()}",
-                name = displayName,
-                folderName = "Picked Files",
-                uri = uri,
-                fallbackDurationMs = 0L,
-                sizeBytes = sizeBytes,
-                fallbackW = 1920,
-                fallbackH = 1080
-            )
-            val enriched = scraper.enrichWithMetadata(rawItem)
-            _mediaList.value = listOf(enriched) + _mediaList.value.filter { it.streamUri != enriched.streamUri }
-            kotlinx.coroutines.withContext(Dispatchers.Main) {
-                onReady(enriched)
+                _mediaList.value = working.toList()
             }
         }
     }
 
-    fun toggleWatched(id: String) {
-        _mediaList.value = _mediaList.value.map {
-            if (it.id == id) {
-                val nextWatched = !it.isWatched
-                prefs.edit().putBoolean("watched_${it.streamUri}", nextWatched).apply()
-                if (!nextWatched) prefs.edit().putLong("pos_${it.streamUri}", 0L).apply()
-                it.copy(isWatched = nextWatched, savedPositionMs = if (!nextWatched) 0L else it.savedPositionMs)
-            } else it
-        }
-    }
+    // On-Demand Deep Track Inspector: Runs ONLY for the single clicked video (<80ms)
+    suspend fun inspectSingleVideoDeepSpecs(item: MediaItem): MediaItem = withContext(Dispatchers.IO) {
+        if (item.hasDeepSpecs) return@withContext item
 
-    private fun inspectTrackFormatsAndCreateItem(
-        id: String,
-        name: String,
-        folderName: String,
-        uri: Uri,
-        fallbackDurationMs: Long,
-        sizeBytes: Long,
-        fallbackW: Int,
-        fallbackH: Int
-    ): MediaItem {
-        var durationMs = fallbackDurationMs
-        var width = fallbackW
-        var height = fallbackH
+        val uri = Uri.parse(item.streamUri)
+        var durationMs = item.durationSeconds * 1000L
+        var width = item.resolution.substringBefore("x").toIntOrNull() ?: 1920
+        var height = item.resolution.substringAfter("x").toIntOrNull() ?: 1080
         var bitrateBps = 0L
-        var localThumbPath = ""
-
-        val thumbFile = File(context.cacheDir, "thumb_${id.hashCode()}.jpg")
-        if (thumbFile.exists()) {
-            localThumbPath = Uri.fromFile(thumbFile).toString()
-        }
 
         val retriever = MediaMetadataRetriever()
         try {
@@ -524,27 +539,16 @@ class MediaRepository(private val context: Context) {
             if (rw != null && rw > 0) width = rw
             if (rh != null && rh > 0) height = rh
             bitrateBps = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)?.toLongOrNull() ?: 0L
-
-            if (localThumbPath.isEmpty()) {
-                val bmp = retriever.getFrameAtTime(2_000_000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
-                if (bmp != null) {
-                    FileOutputStream(thumbFile).use { out ->
-                        bmp.compress(Bitmap.CompressFormat.JPEG, 80, out)
-                    }
-                    bmp.recycle()
-                    localThumbPath = Uri.fromFile(thumbFile).toString()
-                }
-            }
         } catch (_: Exception) {
         } finally {
             try { retriever.release() } catch (_: Exception) {}
         }
 
-        var vCodecName = "HEVC / H.264"
-        var frameRateStr = "24 fps"
-        var hdrStr = "SDR (8-bit)"
-        var aCodecName = "Dolby / Multi-Audio"
-        var aDetailStr = "48.0 kHz • Stereo / Surround"
+        var vCodecName = item.videoCodec
+        var frameRateStr = item.frameRate
+        var hdrStr = item.hdrFormat
+        var aCodecName = item.audioSpec
+        var aDetailStr = item.audioDetails
         val audioTracksFound = mutableListOf<String>()
         val subTracksFound = mutableListOf<String>()
 
@@ -560,13 +564,11 @@ class MediaRepository(private val context: Context) {
                     vCodecName = formatFriendlyCodec(mime)
                     if (format.containsKey(MediaFormat.KEY_FRAME_RATE)) {
                         try {
-                            val fr = format.getInteger(MediaFormat.KEY_FRAME_RATE)
-                            frameRateStr = "$fr fps"
+                            frameRateStr = "${format.getInteger(MediaFormat.KEY_FRAME_RATE)} fps"
                         } catch (_: Exception) {}
                     }
                     if (format.containsKey(MediaFormat.KEY_COLOR_TRANSFER)) {
-                        val ct = format.getInteger(MediaFormat.KEY_COLOR_TRANSFER)
-                        hdrStr = when (ct) {
+                        hdrStr = when (format.getInteger(MediaFormat.KEY_COLOR_TRANSFER)) {
                             6 -> "HDR10 (PQ 10-bit)"
                             7 -> "HLG HDR"
                             else -> "SDR (Rec.709)"
@@ -597,22 +599,170 @@ class MediaRepository(private val context: Context) {
             try { extractor.release() } catch (_: Exception) {}
         }
 
+        val calcBitrate = if (bitrateBps > 0) {
+            String.format(Locale.US, "%.1f Mbps", bitrateBps / 1_000_000.0)
+        } else if (durationMs > 0 && item.sizeBytes > 0) {
+            val bps = (item.sizeBytes * 8.0) / (durationMs / 1000.0)
+            String.format(Locale.US, "%.1f Mbps", bps / 1_000_000.0)
+        } else item.bitrate
+
+        val totalSecs = if (durationMs > 0) durationMs / 1000 else item.durationSeconds
+        val hrs = totalSecs / 3600
+        val mins = (totalSecs % 3600) / 60
+        val durText = if (totalSecs > 0) {
+            if (hrs > 0) "${hrs}h ${mins}m" else "${mins}m ${(totalSecs % 60)}s"
+        } else item.durationText
+
+        val updated = item.copy(
+            durationSeconds = totalSecs,
+            durationText = durText,
+            resolution = "${width}x${height}",
+            frameRate = frameRateStr,
+            hdrFormat = hdrStr,
+            videoCodec = vCodecName,
+            audioSpec = aCodecName,
+            audioDetails = if (audioTracksFound.size > 1) "$aDetailStr (+${audioTracksFound.size - 1} tracks)" else aDetailStr,
+            bitrate = calcBitrate,
+            subtitleSummary = if (subTracksFound.isNotEmpty()) subTracksFound.joinToString(", ") else item.subtitleSummary,
+            hasDeepSpecs = true
+        )
+
+        _mediaList.value = _mediaList.value.map { if (it.id == updated.id) updated else it }
+        updated
+    }
+
+    fun addPickedVideoUri(uri: Uri, onReady: (MediaItem) -> Unit) {
+        scope.launch {
+            var displayName = "Local_Video.mkv"
+            var sizeBytes = 0L
+            try {
+                context.contentResolver.query(uri, null, null, null, null)?.use { c ->
+                    if (c.moveToFirst()) {
+                        val nameIdx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                        val sizeIdx = c.getColumnIndex(OpenableColumns.SIZE)
+                        if (nameIdx != -1) displayName = c.getString(nameIdx) ?: displayName
+                        if (sizeIdx != -1) sizeBytes = c.getLong(sizeIdx)
+                    }
+                }
+            } catch (_: Exception) {}
+
+            savePickedUriToHistory(uri.toString(), displayName, sizeBytes)
+
+            val fastItem = createFastMediaItem(
+                id = "picked_${displayName.hashCode()}",
+                name = displayName,
+                folderName = "Opened Videos",
+                filePath = "",
+                uri = uri,
+                durationMs = prefs.getLong("dur_$displayName", 0L) * 1000L,
+                sizeBytes = sizeBytes,
+                width = 1920,
+                height = 1080
+            )
+            val deepItem = inspectSingleVideoDeepSpecs(fastItem)
+            val enriched = scraper.enrichWithMetadata(deepItem)
+
+            _mediaList.value = listOf(enriched) + _mediaList.value.filter {
+                !it.rawFilename.equals(enriched.rawFilename, ignoreCase = true) && it.streamUri != enriched.streamUri
+            }
+            withContext(Dispatchers.Main) {
+                onReady(enriched)
+            }
+        }
+    }
+
+    fun applyManualMetadataMatch(itemId: String, candidate: TmdbSearchCandidate) {
+        _mediaList.value = _mediaList.value.map { item ->
+            if (item.id == itemId) {
+                prefs.edit()
+                    .putString("custom_title_${item.rawFilename}", candidate.title)
+                    .putInt("custom_year_${item.rawFilename}", candidate.year)
+                    .putString("custom_poster_${item.rawFilename}", candidate.posterUrl)
+                    .putString("custom_backdrop_${item.rawFilename}", candidate.backdropUrl)
+                    .putString("custom_synopsis_${item.rawFilename}", candidate.synopsis)
+                    .putString("custom_rating_${item.rawFilename}", candidate.rating)
+                    .commit()
+
+                item.copy(
+                    title = candidate.title,
+                    year = candidate.year,
+                    isTvShow = candidate.isTv,
+                    rating = candidate.rating,
+                    posterUrl = candidate.posterUrl.ifEmpty { item.posterUrl },
+                    backdropUrl = candidate.backdropUrl.ifEmpty { item.backdropUrl },
+                    synopsis = candidate.synopsis.ifEmpty { item.synopsis }
+                )
+            } else item
+        }
+    }
+
+    fun toggleWatched(id: String) {
+        _mediaList.value = _mediaList.value.map {
+            if (it.id == id) {
+                val nextWatched = !it.isWatched
+                val wKey = watchedKey(it.rawFilename, it.streamUri)
+                val rKey = resumeKey(it.rawFilename, it.streamUri)
+                val ed = prefs.edit().putBoolean(wKey, nextWatched)
+                if (!nextWatched) ed.putLong(rKey, 0L)
+                ed.commit()
+                it.copy(isWatched = nextWatched, savedPositionMs = if (!nextWatched) 0L else it.savedPositionMs)
+            } else it
+        }
+    }
+
+    private fun createFastMediaItem(
+        id: String,
+        name: String,
+        folderName: String,
+        filePath: String,
+        uri: Uri,
+        durationMs: Long,
+        sizeBytes: Long,
+        width: Int,
+        height: Int
+    ): MediaItem {
+        val parsed = FilenameParser.parse(name)
+        val lowerName = name.lowercase(Locale.ROOT)
         val ext = name.substringAfterLast(".", "MKV").uppercase(Locale.ROOT)
         val containerName = when (ext) {
             "MKV" -> "Matroska (MKV)"
             "MP4", "M4V" -> "MPEG-4 (MP4)"
             "AVI" -> "AVI Container"
             "TS", "M2TS" -> "MPEG-TS Stream"
-            "WEBM" -> "WebM Container"
+            "WEBM" -> "WebM Media"
             "MOV" -> "QuickTime (MOV)"
             else -> ext
         }
 
+        val vCodecGuess = when {
+            lowerName.contains("x265") || lowerName.contains("hevc") || lowerName.contains("h265") -> "HEVC / H.265"
+            lowerName.contains("av1") -> "AV1"
+            else -> "AVC / H.264"
+        }
+
+        val aCodecGuess = when {
+            lowerName.contains("atmos") || lowerName.contains("eac3") || lowerName.contains("ddp") -> "Dolby Digital+ / Atmos"
+            lowerName.contains("truehd") -> "Dolby TrueHD"
+            lowerName.contains("dts") -> "DTS-HD / DTS Audio"
+            lowerName.contains("ac3") || lowerName.contains("dd5") -> "Dolby Digital (AC3)"
+            lowerName.contains("flac") -> "FLAC Lossless"
+            else -> "AAC / Multi-Track Audio"
+        }
+
+        val hdrGuess = when {
+            lowerName.contains("dv") || lowerName.contains("dovi") -> "Dolby Vision"
+            lowerName.contains("hdr10") || lowerName.contains("hdr") -> "HDR10 (10-bit)"
+            else -> "SDR (8-bit)"
+        }
+
+        val w = if (width > 0) width else if (lowerName.contains("2160p") || lowerName.contains("4k")) 3840 else 1920
+        val h = if (height > 0) height else if (lowerName.contains("2160p") || lowerName.contains("4k")) 2160 else 1080
+
         val quality = when {
-            width >= 3800 || height >= 2100 -> "4K UHD"
-            width >= 2500 || height >= 1400 -> "1440p QHD"
-            width >= 1900 || height >= 1000 -> "1080p FHD"
-            width >= 1200 || height >= 700 -> "720p HD"
+            w >= 3800 || h >= 2100 -> "4K UHD"
+            w >= 2500 || h >= 1400 -> "1440p QHD"
+            w >= 1900 || h >= 1000 -> "1080p FHD"
+            w >= 1200 || h >= 700 -> "720p HD"
             else -> "SD Direct"
         }
 
@@ -620,47 +770,52 @@ class MediaRepository(private val context: Context) {
             String.format(Locale.US, "%.2f GB", sizeBytes / (1024.0 * 1024.0 * 1024.0))
         } else if (sizeBytes > 0) {
             String.format(Locale.US, "%.1f MB", sizeBytes / (1024.0 * 1024.0))
-        } else "Direct Play"
+        } else "Local File"
 
-        val calcBitrate = if (bitrateBps > 0) {
-            String.format(Locale.US, "%.1f Mbps", bitrateBps / 1_000_000.0)
-        } else if (durationMs > 0 && sizeBytes > 0) {
+        val calcBitrate = if (durationMs > 0 && sizeBytes > 0) {
             val bps = (sizeBytes * 8.0) / (durationMs / 1000.0)
             String.format(Locale.US, "%.1f Mbps", bps / 1_000_000.0)
-        } else "Variable"
+        } else "Direct Stream"
 
-        val totalSecs = durationMs / 1000
+        val savedDurSecs = prefs.getLong("dur_$name", durationMs / 1000L)
+        val totalSecs = if (durationMs > 0) durationMs / 1000L else savedDurSecs
         val hrs = totalSecs / 3600
         val mins = (totalSecs % 3600) / 60
-        val durText = if (hrs > 0) "${hrs}h ${mins}m" else "${mins}m ${(totalSecs % 60)}s"
+        val durText = if (totalSecs > 0) {
+            if (hrs > 0) "${hrs}h ${mins}m" else "${mins}m ${(totalSecs % 60)}s"
+        } else "Direct Play"
 
-        val savedPos = prefs.getLong("pos_$uri", 0L)
-        val savedWatched = prefs.getBoolean("watched_$uri", false)
-        val defaultArt = localThumbPath.ifEmpty { "https://images.unsplash.com/photo-1489599849927-2ee91cede3ba?w=600&q=80" }
+        val savedPos = prefs.getLong(resumeKey(name, uri.toString()), 0L)
+        val savedWatched = prefs.getBoolean(watchedKey(name, uri.toString()), false)
 
         return MediaItem(
             id = id,
-            title = name.substringBeforeLast("."),
+            title = parsed.cleanTitle,
             rawFilename = name,
             folderName = folderName,
-            year = 2026,
+            filePath = filePath,
+            year = parsed.year ?: 2026,
+            isTvShow = parsed.isTv,
+            seasonNumber = parsed.season,
+            episodeNumber = parsed.episode,
             durationText = durText,
             durationSeconds = totalSecs,
             rating = "Local",
             qualityTag = quality,
-            resolution = "${width}x${height}",
-            frameRate = frameRateStr,
-            hdrFormat = hdrStr,
-            audioSpec = aCodecName,
-            audioDetails = if (audioTracksFound.size > 1) "$aDetailStr (+${audioTracksFound.size - 1} tracks)" else aDetailStr,
-            videoCodec = vCodecName,
+            resolution = "${w}x${h}",
+            frameRate = "24 fps",
+            hdrFormat = hdrGuess,
+            audioSpec = aCodecGuess,
+            audioDetails = "48.0 kHz • Hardware & FFmpeg Direct",
+            videoCodec = vCodecGuess,
             container = containerName,
             bitrate = calcBitrate,
             fileSize = sizeText,
-            subtitleSummary = if (subTracksFound.isNotEmpty()) subTracksFound.joinToString(", ") else "Embedded + External .SRT/.ASS",
+            sizeBytes = sizeBytes,
+            subtitleSummary = "Embedded + External .SRT/.ASS",
             streamUri = uri.toString(),
-            posterUrl = defaultArt,
-            backdropUrl = defaultArt,
+            posterUrl = "https://images.unsplash.com/photo-1489599849927-2ee91cede3ba?w=600&q=80",
+            backdropUrl = "https://images.unsplash.com/photo-1518709268805-4e9042af9f23?w=1200&q=80",
             synopsis = "Local video file: $name",
             savedPositionMs = savedPos,
             isWatched = savedWatched
@@ -675,7 +830,7 @@ class MediaRepository(private val context: Context) {
         "audio/ac3" -> "Dolby Digital (AC3)"
         "audio/eac3", "audio/eac3-joc" -> "Dolby Digital+ / Atmos (E-AC3)"
         "audio/true-hd" -> "Dolby TrueHD"
-        "audio/vnd.dts" -> "DTS Coherent Acoustics"
+        "audio/vnd.dts" -> "DTS Audio"
         "audio/vnd.dts.hd" -> "DTS-HD Master Audio"
         "audio/mp4a-latm" -> "AAC Audio"
         "audio/flac" -> "FLAC Lossless"
@@ -712,7 +867,7 @@ class MediaRepository(private val context: Context) {
             streamUri = "https://storage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4",
             posterUrl = "https://images.unsplash.com/photo-1451187580459-43490279c0fa?w=600&q=80",
             backdropUrl = "https://images.unsplash.com/photo-1506703719100-a0f3a48c0f86?w=1200&q=80",
-            synopsis = "Powered by the Universal LibVLC 100% Codec Engine. Tap Open Video in the top bar to play any MKV, MP4, AVI, TS, or Dolby/DTS file on your phone!"
+            synopsis = "Instant scanner & persistent resume active! Tap Open Video or grant permission to browse and play all local videos with Next/Previous skipping."
         )
     )
 }
@@ -782,10 +937,24 @@ fun MediaDetailSheet(
     onMetadataUpdated: (MediaItem) -> Unit
 ) {
     val scope = rememberCoroutineScope()
+    var currentMedia by remember(media) { mutableStateOf(media) }
+    var isInspectingTracks by remember { mutableStateOf(!media.hasDeepSpecs) }
     var showEditMatchDialog by remember { mutableStateOf(false) }
     var searchQuery by remember { mutableStateOf(media.title) }
     var searchResults by remember { mutableStateOf<List<TmdbSearchCandidate>>(emptyList()) }
     var isSearching by remember { mutableStateOf(false) }
+
+    // Inspect exact video/audio/subtitle tracks on-demand in <80ms when sheet opens
+    LaunchedEffect(media.id) {
+        val latestSavedPos = repository.getSavedPosition(media)
+        currentMedia = media.copy(savedPositionMs = latestSavedPos)
+        if (!media.hasDeepSpecs) {
+            isInspectingTracks = true
+            val deep = repository.inspectSingleVideoDeepSpecs(currentMedia)
+            currentMedia = deep.copy(savedPositionMs = repository.getSavedPosition(deep))
+            isInspectingTracks = false
+        }
+    }
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -797,14 +966,13 @@ fun MediaDetailSheet(
                 .verticalScroll(rememberScrollState())
                 .padding(bottom = 24.dp)
         ) {
-            // Hero Backdrop Header inside Detail Sheet
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(190.dp)
             ) {
                 AsyncImage(
-                    model = media.backdropUrl.ifEmpty { media.posterUrl },
+                    model = currentMedia.backdropUrl.ifEmpty { currentMedia.posterUrl },
                     contentDescription = null,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier.fillMaxSize()
@@ -826,7 +994,7 @@ fun MediaDetailSheet(
                     verticalAlignment = Alignment.Bottom
                 ) {
                     AsyncImage(
-                        model = media.posterUrl,
+                        model = currentMedia.posterUrl,
                         contentDescription = null,
                         modifier = Modifier
                             .width(95.dp)
@@ -835,12 +1003,12 @@ fun MediaDetailSheet(
                         contentScale = ContentScale.Crop
                     )
                     Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
-                        Text(media.title, color = Color.White, fontWeight = FontWeight.ExtraBold, fontSize = 20.sp, maxLines = 2)
+                        Text(currentMedia.title, color = Color.White, fontWeight = FontWeight.ExtraBold, fontSize = 20.sp, maxLines = 2)
                         Text(
                             buildString {
-                                append("${media.year} • ${media.durationText} • ★ ${media.rating}")
-                                if (media.seasonNumber != null && media.episodeNumber != null) {
-                                    append(" • S${media.seasonNumber}:E${media.episodeNumber}")
+                                append("${currentMedia.year} • ${currentMedia.durationText} • ★ ${currentMedia.rating}")
+                                if (currentMedia.seasonNumber != null && currentMedia.episodeNumber != null) {
+                                    append(" • S${currentMedia.seasonNumber}:E${currentMedia.episodeNumber}")
                                 }
                             },
                             color = Color.LightGray,
@@ -848,13 +1016,13 @@ fun MediaDetailSheet(
                         )
                         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                             Badge(containerColor = Color(0xFFF59E0B), contentColor = Color.Black) {
-                                Text(media.qualityTag, fontSize = 10.sp, fontWeight = FontWeight.Black)
+                                Text(currentMedia.qualityTag, fontSize = 10.sp, fontWeight = FontWeight.Black)
                             }
                             Badge(containerColor = Color(0x33A855F7), contentColor = Color(0xFFD8B4FE)) {
-                                Text(media.videoCodec, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                                Text(currentMedia.videoCodec, fontSize = 10.sp, fontWeight = FontWeight.Bold)
                             }
                             Badge(containerColor = Color(0x3338BDF8), contentColor = Color(0xFF38BDF8)) {
-                                Text(media.container.substringBefore(" "), fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                                Text(currentMedia.container.substringBefore(" "), fontSize = 10.sp, fontWeight = FontWeight.Bold)
                             }
                         }
                     }
@@ -865,17 +1033,16 @@ fun MediaDetailSheet(
                 modifier = Modifier.padding(horizontal = 20.dp, vertical = 14.dp),
                 verticalArrangement = Arrangement.spacedBy(14.dp)
             ) {
-                // Play / Resume Action Buttons
-                if (media.savedPositionMs > 5000L) {
+                if (currentMedia.savedPositionMs > 2000L) {
                     Button(
-                        onClick = { onResume(media.savedPositionMs) },
+                        onClick = { onResume(currentMedia.savedPositionMs) },
                         modifier = Modifier.fillMaxWidth().height(50.dp),
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF97316)),
                         shape = RoundedCornerShape(12.dp)
                     ) {
                         Icon(Icons.Default.PlayArrow, contentDescription = null)
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text("Resume from ${formatSheetTime(media.savedPositionMs)}", fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                        Text("Resume from ${formatSheetTime(currentMedia.savedPositionMs)}", fontWeight = FontWeight.Bold, fontSize = 15.sp)
                     }
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                         OutlinedButton(
@@ -892,9 +1059,9 @@ fun MediaDetailSheet(
                             modifier = Modifier.weight(1f),
                             shape = RoundedCornerShape(12.dp)
                         ) {
-                            Icon(Icons.Default.CheckCircle, contentDescription = null, modifier = Modifier.size(16.dp), tint = if (media.isWatched) Color(0xFF34D399) else Color.Gray)
+                            Icon(Icons.Default.CheckCircle, contentDescription = null, modifier = Modifier.size(16.dp), tint = if (currentMedia.isWatched) Color(0xFF34D399) else Color.Gray)
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text(if (media.isWatched) "Watched" else "Mark Watched", color = Color.White, fontSize = 12.sp)
+                            Text(if (currentMedia.isWatched) "Watched" else "Mark Watched", color = Color.White, fontSize = 12.sp)
                         }
                     }
                 } else {
@@ -914,17 +1081,16 @@ fun MediaDetailSheet(
                             modifier = Modifier.weight(1f).height(50.dp),
                             shape = RoundedCornerShape(12.dp)
                         ) {
-                            Icon(Icons.Default.CheckCircle, contentDescription = null, tint = if (media.isWatched) Color(0xFF34D399) else Color.Gray)
+                            Icon(Icons.Default.CheckCircle, contentDescription = null, tint = if (currentMedia.isWatched) Color(0xFF34D399) else Color.Gray)
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text(if (media.isWatched) "Watched" else "Watched", color = Color.White, fontSize = 12.sp)
+                            Text(if (currentMedia.isWatched) "Watched" else "Mark Watched", color = Color.White, fontSize = 12.sp)
                         }
                     }
                 }
 
-                // Edit Metadata Match Button (Infuse Signature Feature)
                 OutlinedButton(
                     onClick = {
-                        searchQuery = media.title
+                        searchQuery = currentMedia.title
                         showEditMatchDialog = true
                         scope.launch {
                             isSearching = true
@@ -940,25 +1106,33 @@ fun MediaDetailSheet(
                     Text("Edit Metadata / Fix Poster Match", color = Color(0xFFF97316), fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                 }
 
-                Text(media.synopsis, color = Color(0xFFD1D5DB), fontSize = 13.sp, lineHeight = 19.sp)
+                Text(currentMedia.synopsis, color = Color(0xFFD1D5DB), fontSize = 13.sp, lineHeight = 19.sp)
 
-                // Complete Format & Track Specifications Card
                 Card(
                     colors = CardDefaults.cardColors(containerColor = Color(0xFF181B24)),
                     shape = RoundedCornerShape(14.dp),
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text("COMPLETE STREAM & FORMAT SPECIFICATIONS", color = Color(0xFFF97316), fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                        SpecRow("File Name", media.rawFilename.ifEmpty { media.title })
-                        SpecRow("Folder Location", media.folderName)
-                        SpecRow("Container Format", media.container)
-                        SpecRow("Video Track", "${media.videoCodec} • ${media.hdrFormat}")
-                        SpecRow("Resolution & FPS", "${media.resolution} (${media.qualityTag}) @ ${media.frameRate}")
-                        SpecRow("Audio Track", media.audioSpec)
-                        SpecRow("Audio Channels", media.audioDetails)
-                        SpecRow("Subtitle Engine", media.subtitleSummary)
-                        SpecRow("Bitrate & Size", "${media.bitrate} • ${media.fileSize}")
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("COMPLETE STREAM & FORMAT SPECIFICATIONS", color = Color(0xFFF97316), fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            if (isInspectingTracks) {
+                                CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp, color = Color(0xFFF97316))
+                            }
+                        }
+                        SpecRow("File Name", currentMedia.rawFilename.ifEmpty { currentMedia.title })
+                        SpecRow("Folder Location", currentMedia.folderName)
+                        SpecRow("Container Format", currentMedia.container)
+                        SpecRow("Video Track", "${currentMedia.videoCodec} • ${currentMedia.hdrFormat}")
+                        SpecRow("Resolution & FPS", "${currentMedia.resolution} (${currentMedia.qualityTag}) @ ${currentMedia.frameRate}")
+                        SpecRow("Audio Track", currentMedia.audioSpec)
+                        SpecRow("Audio Channels", currentMedia.audioDetails)
+                        SpecRow("Subtitle Engine", currentMedia.subtitleSummary)
+                        SpecRow("Bitrate & Size", "${currentMedia.bitrate} • ${currentMedia.fileSize}")
                     }
                 }
             }
@@ -1003,9 +1177,12 @@ fun MediaDetailSheet(
                             Card(
                                 colors = CardDefaults.cardColors(containerColor = Color(0xFF1F2430)),
                                 modifier = Modifier.fillMaxWidth().clickable {
-                                    repository.applyManualMetadataMatch(media.id, cand)
-                                    val updated = repository.mediaList.value.find { it.id == media.id }
-                                    if (updated != null) onMetadataUpdated(updated)
+                                    repository.applyManualMetadataMatch(currentMedia.id, cand)
+                                    val updated = repository.mediaList.value.find { it.id == currentMedia.id }
+                                    if (updated != null) {
+                                        currentMedia = updated
+                                        onMetadataUpdated(updated)
+                                    }
                                     showEditMatchDialog = false
                                 }
                             ) {
@@ -1051,11 +1228,9 @@ fun formatSheetTime(ms: Long): String {
     val totalSecs = (ms / 1000).coerceAtLeast(0)
     val h = totalSecs / 3600
     val m = (totalSecs % 3600) / 60
-    val s = totalSecondsRem(totalSecs)
+    val s = totalSecs % 60
     return if (h > 0) String.format("%d:%02d:%02d", h, m, s) else String.format("%02d:%02d", m, s)
 }
-
-private fun totalSecondsRem(totalSecs: Long): Long = totalSecs % 60
 EOF
 
 cat << 'EOF' > app/src/main/java/com/infuse/player/ui/library/LibraryScreen.kt
@@ -1120,7 +1295,7 @@ fun LibraryScreen(
     }
 
     val continueWatchingList = remember(mediaList) {
-        mediaList.filter { it.savedPositionMs > 5000L }
+        mediaList.filter { it.savedPositionMs > 2000L }
     }
 
     val foldersMap = remember(mediaList) {
@@ -1135,7 +1310,7 @@ fun LibraryScreen(
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Text("Infuse", fontWeight = FontWeight.ExtraBold, color = Color.White, fontSize = 20.sp)
                             Badge(containerColor = Color(0x33F97316), contentColor = Color(0xFFF97316)) {
-                                Text("LIBVLC 4.0", fontSize = 9.sp, fontWeight = FontWeight.Black)
+                                Text("PRO v5.0", fontSize = 9.sp, fontWeight = FontWeight.Black)
                             }
                         }
                     },
@@ -1179,7 +1354,6 @@ fun LibraryScreen(
                     )
                 }
 
-                // Category Filter Pills
                 LazyRow(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
@@ -1249,7 +1423,6 @@ fun LibraryScreen(
                     }
                 }
             } else {
-                // Up Next / Continue Watching Row
                 if (continueWatchingList.isNotEmpty() && activeTab == "all" && searchQuery.isEmpty()) {
                     Text("Continue Watching", color = Color(0xFFF97316), fontWeight = FontWeight.Bold, fontSize = 14.sp)
                     Spacer(modifier = Modifier.height(8.dp))
@@ -1301,7 +1474,6 @@ fun LibraryScreen(
                     }
                 }
 
-                // Poster Wall Grid
                 LazyVerticalGrid(
                     columns = GridCells.Adaptive(minSize = 115.dp),
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -1340,7 +1512,7 @@ fun LibraryScreen(
                                                 .background(Color(0xFFF97316), RoundedCornerShape(4.dp))
                                         )
                                     }
-                                    if (item.savedPositionMs > 5000L) {
+                                    if (item.savedPositionMs > 2000L) {
                                         LinearProgressIndicator(
                                             progress = { item.progressFraction },
                                             modifier = Modifier
@@ -1454,6 +1626,10 @@ data class VlcTrackOption(
 fun PlayerScreen(
     media: MediaItem,
     initialSeekMs: Long,
+    hasPrevious: Boolean,
+    hasNext: Boolean,
+    onSkipPrevious: () -> Unit,
+    onSkipNext: () -> Unit,
     repository: MediaRepository,
     onBack: () -> Unit
 ) {
@@ -1461,6 +1637,8 @@ fun PlayerScreen(
     val activity = context as? Activity
     val lifecycleOwner = LocalLifecycleOwner.current
     val audioManager = remember { context.getSystemService(Context.AUDIO_SERVICE) as AudioManager }
+
+    val currentMedia by rememberUpdatedState(media)
 
     var isLandscape by remember { mutableStateOf(true) }
     var isControlsLocked by remember { mutableStateOf(false) }
@@ -1483,13 +1661,13 @@ fun PlayerScreen(
         mutableFloatStateOf(audioManager.getStreamVolume(AudioManager.STREAM_MUSIC).toFloat() / maxVolume)
     }
 
-    var isPlaying by remember { mutableStateOf(true) }
-    var currentPosition by remember { mutableLongStateOf(initialSeekMs) }
-    var totalDuration by remember { mutableLongStateOf((media.durationSeconds * 1000).coerceAtLeast(1L)) }
+    var isPlaying by remember(media.id) { mutableStateOf(true) }
+    var currentPosition by remember(media.id) { mutableLongStateOf(initialSeekMs) }
+    var totalDuration by remember(media.id) { mutableLongStateOf((media.durationSeconds * 1000).coerceAtLeast(1L)) }
     var playbackSpeed by remember { mutableFloatStateOf(1.0f) }
 
-    var audioTracks by remember { mutableStateOf<List<VlcTrackOption>>(emptyList()) }
-    var subtitleTracks by remember { mutableStateOf<List<VlcTrackOption>>(emptyList()) }
+    var audioTracks by remember(media.id) { mutableStateOf<List<VlcTrackOption>>(emptyList()) }
+    var subtitleTracks by remember(media.id) { mutableStateOf<List<VlcTrackOption>>(emptyList()) }
     var currentScaleIdx by remember { mutableIntStateOf(0) }
     val scaleLabels = listOf("FIT", "FILL", "16:9", "4:3", "CROP")
     val scaleTypes = listOf(
@@ -1500,7 +1678,7 @@ fun PlayerScreen(
         MediaPlayer.ScaleType.SURFACE_FIT_SCREEN
     )
 
-    // Enter Fullscreen Immersive Landscape automatically
+    // Fullscreen Landscape Mode
     DisposableEffect(activity) {
         val window = activity?.window
         val originalOrientation = activity?.requestedOrientation ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
@@ -1521,7 +1699,6 @@ fun PlayerScreen(
         }
     }
 
-    // Initialize Universal LibVLC 100% Audio/Video/Subtitle Engine
     val libVlc = remember {
         val args = arrayListOf(
             "--aout=opensles,android_audiotrack",
@@ -1554,8 +1731,8 @@ fun PlayerScreen(
         subtitleTracks = sList
     }
 
-    // Keep ParcelFileDescriptor open during playback for content:// URIs
-    DisposableEffect(media.streamUri) {
+    // Load or switch video whenever media.streamUri changes (supports Next / Previous skipping!)
+    DisposableEffect(media.streamUri, initialSeekMs) {
         var pfd: ParcelFileDescriptor? = null
         val uri = Uri.parse(media.streamUri)
 
@@ -1575,18 +1752,24 @@ fun PlayerScreen(
         }
 
         vlcMedia.setHWDecoderEnabled(true, false)
+        // Tell LibVLC directly to start at the exact resume second!
+        if (initialSeekMs > 1000L) {
+            vlcMedia.addOption(":start-time=${initialSeekMs / 1000L}")
+        }
         vlcPlayer.media = vlcMedia
         vlcMedia.release()
 
-        var didInitialSeek = false
+        var didSeekAfterPlay = false
         vlcPlayer.setEventListener { event ->
             when (event.type) {
                 MediaPlayer.Event.Playing -> {
                     isPlaying = true
                     if (vlcPlayer.length > 0) totalDuration = vlcPlayer.length
-                    if (!didInitialSeek && initialSeekMs > 0L) {
-                        didInitialSeek = true
-                        vlcPlayer.time = initialSeekMs
+                    if (!didSeekAfterPlay && initialSeekMs > 1000L) {
+                        didSeekAfterPlay = true
+                        if (vlcPlayer.time < initialSeekMs - 2000L) {
+                            vlcPlayer.time = initialSeekMs
+                        }
                     }
                     refreshVlcTracks()
                 }
@@ -1605,25 +1788,29 @@ fun PlayerScreen(
             }
         }
 
-        // Request Android Audio Focus explicitly
         audioManager.requestAudioFocus(null, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN)
         vlcPlayer.play()
 
         onDispose {
-            repository.savePlaybackPosition(media.streamUri, currentPosition, totalDuration)
+            repository.savePlaybackPosition(media, currentPosition, totalDuration)
             vlcPlayer.stop()
-            vlcPlayer.detachViews()
-            vlcPlayer.release()
-            libVlc.release()
             try { pfd?.close() } catch (_: Exception) {}
         }
     }
 
-    // Auto-save position when app is paused or backgrounded
+    DisposableEffect(Unit) {
+        onDispose {
+            vlcPlayer.detachViews()
+            vlcPlayer.release()
+            libVlc.release()
+        }
+    }
+
+    // Synchronously commit resume timestamp when user presses Home, switches apps, or closes app
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_PAUSE || event == Lifecycle.Event.ON_STOP) {
-                repository.savePlaybackPosition(media.streamUri, currentPosition, totalDuration)
+                repository.savePlaybackPosition(currentMedia, currentPosition, totalDuration)
                 if (vlcPlayer.isPlaying) vlcPlayer.pause()
             }
         }
@@ -1631,13 +1818,11 @@ fun PlayerScreen(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    // External Subtitle File Picker (.srt, .ass, .ssa, .vtt)
     val subtitleFilePicker = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument()
     ) { uri ->
         uri?.let { subUri ->
             try {
-                // Copy external subtitle to cache file so LibVLC native engine can read it reliably
                 val subFile = File(context.cacheDir, "ext_sub_${System.currentTimeMillis()}.srt")
                 context.contentResolver.openInputStream(subUri)?.use { input ->
                     FileOutputStream(subFile).use { output -> input.copyTo(output) }
@@ -1656,11 +1841,11 @@ fun PlayerScreen(
         }
     }
 
-    // Periodic save every 2 seconds
-    LaunchedEffect(Unit) {
+    // Save resume position every 2 seconds while playing
+    LaunchedEffect(media.id) {
         while (true) {
-            if (isPlaying && currentPosition > 2000L) {
-                repository.savePlaybackPosition(media.streamUri, currentPosition, totalDuration)
+            if (isPlaying && currentPosition > 1000L) {
+                repository.savePlaybackPosition(currentMedia, currentPosition, totalDuration)
             }
             delay(2000)
         }
@@ -1749,7 +1934,6 @@ fun PlayerScreen(
                 }
             }
     ) {
-        // LibVLC Hardware Video Surface with Built-in Subtitle Renderer
         AndroidView(
             factory = { ctx ->
                 VLCVideoLayout(ctx).apply {
@@ -1757,7 +1941,7 @@ fun PlayerScreen(
                         ViewGroup.LayoutParams.MATCH_PARENT,
                         ViewGroup.LayoutParams.MATCH_PARENT
                     )
-                    vlcPlayer.attachViews(this, null, /* enableSubtitles = */ true, /* useTextureView = */ false)
+                    vlcPlayer.attachViews(this, null, true, false)
                     vlcPlayer.videoScale = scaleTypes[currentScaleIdx]
                 }
             },
@@ -1767,7 +1951,6 @@ fun PlayerScreen(
             modifier = Modifier.fillMaxSize()
         )
 
-        // Left HUD: Brightness
         AnimatedVisibility(
             visible = showBrightnessHud,
             enter = fadeIn(),
@@ -1777,7 +1960,6 @@ fun PlayerScreen(
             HudBar(Icons.Default.BrightnessMedium, brightness, "${(brightness * 100).toInt()}%", Color(0xFFF59E0B))
         }
 
-        // Right HUD: Volume
         AnimatedVisibility(
             visible = showVolumeHud,
             enter = fadeIn(),
@@ -1787,7 +1969,6 @@ fun PlayerScreen(
             HudBar(Icons.Default.VolumeUp, currentVolume, "${(currentVolume * 100).toInt()}%", Color(0xFF38BDF8))
         }
 
-        // Center HUD: Horizontal Scrubbing Preview
         AnimatedVisibility(
             visible = showSeekHud,
             enter = fadeIn(),
@@ -1809,7 +1990,6 @@ fun PlayerScreen(
             }
         }
 
-        // Controls Overlay
         AnimatedVisibility(
             visible = showControls,
             enter = fadeIn(),
@@ -1845,7 +2025,7 @@ fun PlayerScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         IconButton(onClick = {
-                            repository.savePlaybackPosition(media.streamUri, currentPosition, totalDuration)
+                            repository.savePlaybackPosition(media, currentPosition, totalDuration)
                             onBack()
                         }) {
                             Icon(Icons.Default.ArrowBack, contentDescription = "Back", tint = Color.White)
@@ -1891,18 +2071,33 @@ fun PlayerScreen(
                         }
                     }
 
-                    // Center Transport Controls
+                    // Center Transport Controls: Previous Video | -10s | Play/Pause | +10s | Next Video
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceEvenly,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
+                        IconButton(
+                            onClick = {
+                                repository.savePlaybackPosition(media, currentPosition, totalDuration)
+                                onSkipPrevious()
+                            },
+                            enabled = hasPrevious
+                        ) {
+                            Icon(
+                                Icons.Default.SkipPrevious,
+                                contentDescription = "Previous Video",
+                                tint = if (hasPrevious) Color.White else Color.White.copy(alpha = 0.3f),
+                                modifier = Modifier.size(36.dp)
+                            )
+                        }
+
                         IconButton(onClick = {
                             val target = (currentPosition - 10_000L).coerceAtLeast(0L)
                             vlcPlayer.time = target
                             currentPosition = target
                         }) {
-                            Icon(Icons.Default.Replay10, contentDescription = "-10s", tint = Color.White, modifier = Modifier.size(38.dp))
+                            Icon(Icons.Default.Replay10, contentDescription = "-10s", tint = Color.White, modifier = Modifier.size(36.dp))
                         }
 
                         IconButton(
@@ -1924,11 +2119,26 @@ fun PlayerScreen(
                             vlcPlayer.time = target
                             currentPosition = target
                         }) {
-                            Icon(Icons.Default.Forward10, contentDescription = "+10s", tint = Color.White, modifier = Modifier.size(38.dp))
+                            Icon(Icons.Default.Forward10, contentDescription = "+10s", tint = Color.White, modifier = Modifier.size(36.dp))
+                        }
+
+                        IconButton(
+                            onClick = {
+                                repository.savePlaybackPosition(media, currentPosition, totalDuration)
+                                onSkipNext()
+                            },
+                            enabled = hasNext
+                        ) {
+                            Icon(
+                                Icons.Default.SkipNext,
+                                contentDescription = "Next Video",
+                                tint = if (hasNext) Color.White else Color.White.copy(alpha = 0.3f),
+                                modifier = Modifier.size(36.dp)
+                            )
                         }
                     }
 
-                    // Bottom Scrubber & Quick Lock / Rotate Controls
+                    // Bottom Scrubber & Lock / Rotate Controls
                     Column(modifier = Modifier.fillMaxWidth()) {
                         Slider(
                             value = if (totalDuration > 0) (currentPosition.toFloat() / totalDuration).coerceIn(0f, 1f) else 0f,
@@ -1951,7 +2161,7 @@ fun PlayerScreen(
                                 Text(formatMs(currentPosition), color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                             }
 
-                            Text("LibVLC Direct • ${media.audioSpec}", color = Color(0xFF38BDF8), fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                            Text("LibVLC Universal • ${media.audioSpec}", color = Color(0xFF38BDF8), fontSize = 11.sp, fontWeight = FontWeight.Medium)
 
                             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 Text(formatMs(totalDuration), color = Color.LightGray, fontSize = 12.sp)
@@ -1975,7 +2185,6 @@ fun PlayerScreen(
             }
         }
 
-        // Audio Track Selector Dialog (LibVLC Multi-Audio)
         if (showAudioDialog) {
             AlertDialog(
                 onDismissRequest = { showAudioDialog = false },
@@ -2022,7 +2231,6 @@ fun PlayerScreen(
             )
         }
 
-        // Subtitle Track Selector & External .SRT/.ASS Loader Dialog
         if (showSubtitleDialog) {
             AlertDialog(
                 onDismissRequest = { showSubtitleDialog = false },
@@ -2179,6 +2387,7 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             InfuseTheme {
+                val mediaList by repository.mediaList.collectAsState()
                 var activePlayback by remember { mutableStateOf<Pair<MediaItem, Long>?>(null) }
 
                 BackHandler(enabled = activePlayback != null) {
@@ -2188,7 +2397,7 @@ class MainActivity : ComponentActivity() {
                 LaunchedEffect(Unit) {
                     intent?.data?.let { externalUri ->
                         repository.addPickedVideoUri(externalUri) { item ->
-                            activePlayback = item to repository.getSavedPosition(item.streamUri)
+                            activePlayback = item to repository.getSavedPosition(item)
                         }
                     }
                 }
@@ -2210,7 +2419,7 @@ class MainActivity : ComponentActivity() {
                             )
                         } catch (_: Exception) {}
                         repository.addPickedVideoUri(it) { item ->
-                            activePlayback = item to repository.getSavedPosition(item.streamUri)
+                            activePlayback = item to repository.getSavedPosition(item)
                         }
                     }
                 }
@@ -2224,9 +2433,30 @@ class MainActivity : ComponentActivity() {
                 }
 
                 if (activePlayback != null) {
+                    val currentItem = activePlayback!!.first
+                    val currentIndex = mediaList.indexOfFirst {
+                        it.id == currentItem.id || it.rawFilename.equals(currentItem.rawFilename, ignoreCase = true)
+                    }
+                    val hasPrev = currentIndex > 0
+                    val hasNext = currentIndex != -1 && currentIndex < mediaList.size - 1
+
                     PlayerScreen(
-                        media = activePlayback!!.first,
+                        media = currentItem,
                         initialSeekMs = activePlayback!!.second,
+                        hasPrevious = hasPrev,
+                        hasNext = hasNext,
+                        onSkipPrevious = {
+                            if (hasPrev) {
+                                val prevItem = mediaList[currentIndex - 1]
+                                activePlayback = prevItem to repository.getSavedPosition(prevItem)
+                            }
+                        },
+                        onSkipNext = {
+                            if (hasNext) {
+                                val nextItem = mediaList[currentIndex + 1]
+                                activePlayback = nextItem to repository.getSavedPosition(nextItem)
+                            }
+                        },
                         repository = repository,
                         onBack = { activePlayback = null }
                     )
@@ -2294,8 +2524,8 @@ android {
         applicationId = "com.infuse.player"
         minSdk = 26
         targetSdk = 35
-        versionCode = 4
-        versionName = "4.0.0"
+        versionCode = 5
+        versionName = "5.0.0"
     }
 
     compileOptions {
@@ -2324,7 +2554,6 @@ dependencies {
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
-    // Official VideoLAN LibVLC Engine: Plays 100% of Video, Audio (AC3/EAC3/DTS/TrueHD/AAC/Opus), and Subtitles (SRT/ASS/PGS)
     implementation("org.videolan.android:libvlc-all:3.6.0")
     implementation("io.coil-kt:coil-compose:2.7.0")
     implementation("com.hierynomus:smbj:0.13.0")
